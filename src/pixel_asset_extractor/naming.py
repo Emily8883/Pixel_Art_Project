@@ -65,9 +65,28 @@ def generate_filename(
     direction: str = "",
     frame_number: int | None = None,
     variant: str = "",
+    canvas_size: tuple[int, int] | None = None,
 ) -> str:
     basename = generate_asset_basename(character_group, category, action, direction, frame_number, variant)
+    if canvas_size is not None:
+        width, height = canvas_size
+        if basename:
+            basename = f"{basename}_{int(width)}x{int(height)}"
+        else:
+            basename = f"{int(width)}x{int(height)}"
     return f"{basename}.png" if basename else ".png"
+
+
+def generate_normalized_filename(
+    character_group: str = "",
+    category: str = "",
+    action: str = "",
+    direction: str = "",
+    frame_number: int | None = None,
+    variant: str = "",
+    canvas_size: tuple[int, int] | None = None,
+) -> str:
+    return generate_filename(character_group, category, action, direction, frame_number, variant, canvas_size=canvas_size)
 
 
 def unique_filename(base_name: str, used_names: set[str]) -> str:

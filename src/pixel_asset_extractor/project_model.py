@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from .models import CropRect
 from .processing import ui_tolerance_to_distance
+from .normalization import NormalizationSettingsModel
 
 
 def utc_now_iso() -> str:
@@ -182,6 +183,20 @@ class AssetRecord:
     created_at: str = field(default_factory=utc_now_iso)
     modified_at: str = field(default_factory=utc_now_iso)
     export_info: ExportInfo = field(default_factory=ExportInfo)
+    normalization: NormalizationSettingsModel = field(default_factory=NormalizationSettingsModel)
+    alignment_group: str = ""
+    is_alignment_group_leader: bool = False
+    contact_x: int | None = None
+    contact_y: int | None = None
+    baseline_y: int | None = None
+    pivot_x: int | None = None
+    pivot_y: int | None = None
+    includes_ground_shadow: bool = False
+    shadow_should_be_separate: bool = False
+    normalized_export_path: str = ""
+    normalized_exported_at: str | None = None
+    normalization_checksum: str | None = None
+    normalization_confirmed: bool = False
     manual_edit_sidecar: str = ""
     manual_edit_checksum: str | None = None
     manual_edit_width: int | None = None
@@ -213,6 +228,20 @@ class AssetRecord:
             "created_at": self.created_at,
             "modified_at": self.modified_at,
             "export_info": self.export_info.to_dict(project_dir),
+            "normalization": self.normalization.to_dict(),
+            "alignment_group": self.alignment_group,
+            "is_alignment_group_leader": self.is_alignment_group_leader,
+            "contact_x": self.contact_x,
+            "contact_y": self.contact_y,
+            "baseline_y": self.baseline_y,
+            "pivot_x": self.pivot_x,
+            "pivot_y": self.pivot_y,
+            "includes_ground_shadow": self.includes_ground_shadow,
+            "shadow_should_be_separate": self.shadow_should_be_separate,
+            "normalized_export_path": self.normalized_export_path,
+            "normalized_exported_at": self.normalized_exported_at,
+            "normalization_checksum": self.normalization_checksum,
+            "normalization_confirmed": self.normalization_confirmed,
             "manual_edit_sidecar": self.manual_edit_sidecar,
             "manual_edit_checksum": self.manual_edit_checksum,
             "manual_edit_width": self.manual_edit_width,
@@ -254,6 +283,20 @@ class AssetRecord:
                 "created_at",
                 "modified_at",
                 "export_info",
+                "normalization",
+                "alignment_group",
+                "is_alignment_group_leader",
+                "contact_x",
+                "contact_y",
+                "baseline_y",
+                "pivot_x",
+                "pivot_y",
+                "includes_ground_shadow",
+                "shadow_should_be_separate",
+                "normalized_export_path",
+                "normalized_exported_at",
+                "normalization_checksum",
+                "normalization_confirmed",
                 "manual_edit_sidecar",
                 "manual_edit_checksum",
                 "manual_edit_width",
@@ -293,6 +336,20 @@ class AssetRecord:
             created_at=str(payload.get("created_at", utc_now_iso())),
             modified_at=str(payload.get("modified_at", utc_now_iso())),
             export_info=ExportInfo.from_dict(payload.get("export_info", {}), project_dir),
+            normalization=NormalizationSettingsModel.from_dict(payload.get("normalization", {})),
+            alignment_group=str(payload.get("alignment_group", "")),
+            is_alignment_group_leader=bool(payload.get("is_alignment_group_leader", False)),
+            contact_x=_maybe_int(payload.get("contact_x")),
+            contact_y=_maybe_int(payload.get("contact_y")),
+            baseline_y=_maybe_int(payload.get("baseline_y")),
+            pivot_x=_maybe_int(payload.get("pivot_x")),
+            pivot_y=_maybe_int(payload.get("pivot_y")),
+            includes_ground_shadow=bool(payload.get("includes_ground_shadow", False)),
+            shadow_should_be_separate=bool(payload.get("shadow_should_be_separate", False)),
+            normalized_export_path=str(payload.get("normalized_export_path", "")),
+            normalized_exported_at=payload.get("normalized_exported_at"),
+            normalization_checksum=payload.get("normalization_checksum"),
+            normalization_confirmed=bool(payload.get("normalization_confirmed", False)),
             manual_edit_sidecar=str(payload.get("manual_edit_sidecar", "")),
             manual_edit_checksum=payload.get("manual_edit_checksum"),
             manual_edit_width=_maybe_int(payload.get("manual_edit_width")),
@@ -326,7 +383,7 @@ class ProjectDefaults:
 class ProjectRecord:
     project_name: str
     project_root_directory: str
-    project_version: int = 4
+    project_version: int = 5
     created_at: str = field(default_factory=utc_now_iso)
     modified_at: str = field(default_factory=utc_now_iso)
     notes: str = ""
@@ -376,7 +433,7 @@ class ProjectRecord:
         return cls(
             project_name=str(payload.get("project_name", "Untitled Project")),
             project_root_directory=project_root_directory,
-            project_version=int(payload.get("project_version", 4)),
+            project_version=int(payload.get("project_version", 5)),
             created_at=str(payload.get("created_at", utc_now_iso())),
             modified_at=str(payload.get("modified_at", utc_now_iso())),
             notes=str(payload.get("notes", "")),
@@ -400,7 +457,7 @@ class SpriteProject:
     def to_dict(self) -> dict[str, Any]:
         project_dir = self.path.parent if self.path else None
         payload = {
-            "config_version": 4,
+            "config_version": 5,
             "project": self.project.to_dict(project_dir),
             "source_sheets": [sheet.to_dict(project_dir) for sheet in self.source_sheets],
             "assets": [asset.to_dict(project_dir) for asset in self.assets],

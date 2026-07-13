@@ -37,7 +37,7 @@ from ..exceptions import ConfigError, CropError, ImageLoadError
 from ..image_tools import analyze_image, crop_image, load_png, pil_image_to_qpixmap
 from ..manual_editing import ManualEditDocument, compute_settings_checksum
 from ..manual_storage import load_sidecar_png, manual_edit_sidecar_path, validate_manual_sidecar
-from ..naming import format_frame_number, generate_filename
+from ..naming import format_frame_number, generate_filename, generate_normalized_filename
 from ..processing import (
     BackgroundRemovalResult,
     BackgroundRemovalSettings,
@@ -135,6 +135,8 @@ class MainWindow(QMainWindow):
         self.reset_background_button.clicked.connect(self._reset_background_removal)
         self.regenerate_filename_button = QPushButton("Regenerate Filename")
         self.regenerate_filename_button.clicked.connect(self._regenerate_filename)
+        self.export_normalized_button = QPushButton("Export Normalized")
+        self.export_normalized_button.clicked.connect(self.export_normalized)
 
         self.tolerance_slider = QSlider(Qt.Orientation.Horizontal)
         self.tolerance_slider.setRange(0, 100)
@@ -242,6 +244,7 @@ class MainWindow(QMainWindow):
             ("Export Raw", self.export_raw),
             ("Export Clean", self.export_clean),
             ("Export Final", self.export_final),
+            ("Export Normalized", self.export_normalized),
             ("Open Output Folder", self.open_output_folder),
             ("Create Freya Movement Template", self.create_freya_template),
             ("Activity Log", self.show_activity_log),
@@ -365,6 +368,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.pick_background_button)
         buttons.addWidget(self.reset_background_button)
         buttons.addWidget(self.regenerate_filename_button)
+        buttons.addWidget(self.export_normalized_button)
         layout.addLayout(buttons)
         layout.addWidget(self.background_swatch)
         layout.addWidget(self.rgb_label)
@@ -1215,6 +1219,31 @@ class MainWindow(QMainWindow):
         self.project_manager.project.mark_modified()
         self._update_ui_from_project()
         self.statusBar().showMessage(f"Exported {destination.name}", 4000)
+
+    def export_normalized(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        if self.project_manager.project.path is None:
+            self._show_error("Cannot export", "Save the project first so normalization sidecars and exports have a project root.")
+            return
+        destination = self._export_destination(
+            asset.normalization.normalized_output_filename
+            or generate_normalized_filename(
+                asset.character_group or asset.display_name,
+                asset.category,
+                asset.action,
+                asset.direction,
+                asset.frame_number,
+                asset.variant,
+                canvas_size=(asset.normalization.output_width, asset.normalization.output_height),
+            ),
+            asset.output_folder,
+        )
+        if destination is None:
+            return
+        self.project_manager.export_normalized_asset(destination, asset.asset_uuid)
+        self._update_ui_from_project()
 
     def _export_destination(self, filename: str, output_folder: str) -> Path | None:
         start = Path(output_folder or self.project_manager.project.project.defaults.output_folder or Path.cwd() / "output")

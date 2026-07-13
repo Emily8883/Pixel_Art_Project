@@ -11,12 +11,29 @@ from PIL import Image
 from .config_store import load_config as load_legacy_config
 from .image_tools import crop_image
 from .manual_editing import ManualEditDocument, compute_settings_checksum
+from .manual_storage import load_sidecar_png, validate_manual_sidecar
+from .normalization import (
+    AlignmentDiagnostics,
+    NormalizedOutputResult,
+    NormalizationSettingsModel,
+    checksum_for_normalization,
+    detect_bottommost_visible_pixel,
+    normalized_thumbnail,
+    place_on_canvas,
+    report_rows,
+    report_to_csv,
+    report_to_json,
+    set_baseline_from_current_sprite,
+    stale_normalized_export,
+    suggest_contact_point,
+    transparent_bounds,
+)
 from .manual_storage import (
     manual_edit_sidecar_path,
     save_sidecar_png,
     validate_manual_sidecar,
 )
-from .naming import format_frame_number, generate_filename, unique_filename
+from .naming import format_frame_number, generate_filename, generate_normalized_filename, unique_filename
 from .processing import BackgroundRemovalSettings, apply_background_removal, ui_tolerance_to_distance
 from .project_model import (
     ActivityEntry,
@@ -175,6 +192,7 @@ class ProjectManager:
             notes=notes,
             workflow_status=WorkflowStatus.cropped if crop_rect else WorkflowStatus.planned,
         )
+        asset.normalization = self._default_normalization_for_asset(asset)
         self._refresh_asset_filenames(asset)
         self.project.assets.append(asset)
         self.active_asset_uuid = asset.asset_uuid
@@ -196,6 +214,7 @@ class ProjectManager:
             modified_at=utc_now_iso(),
             created_at=utc_now_iso(),
             extras=dict(asset.extras),
+            normalization=NormalizationSettingsModel.from_dict(asset.normalization.to_dict()),
         )
         self._refresh_asset_filenames(new_asset)
         self.project.assets.append(new_asset)
@@ -261,6 +280,7 @@ class ProjectManager:
         clean_output_filename: str | None = None,
         output_folder: str | None = None,
         notes: str | None = None,
+        normalization: NormalizationSettingsModel | None = None,
     ) -> AssetRecord:
         asset = self.get_asset(asset_uuid)
         manual_invalidated = False
@@ -276,6 +296,7 @@ class ProjectManager:
                 clean_output_filename,
                 output_folder,
                 notes,
+                normalization,
             )
         ):
             asset.workflow_status = WorkflowStatus.needs_revision
@@ -305,6 +326,8 @@ class ProjectManager:
             asset.output_folder = output_folder
         if notes is not None:
             asset.notes = notes
+        if normalization is not None:
+            asset.normalization = normalization
         if manual_invalidated:
             self.invalidate_manual_edits(asset_uuid, "cleanup_or_crop_changed")
         asset.modified_at = utc_now_iso()
@@ -419,6 +442,71 @@ class ProjectManager:
         self.project.mark_modified()
         return destination_path
 
+    def normalize_active_asset(self, asset_uuid: str | None = None) -> NormalizedOutputResult:
+        asset = self.get_asset(asset_uuid) if asset_uuid is not None else self.active_asset
+        if asset is None:
+            raise RuntimeError("No active asset")
+        result = self._normalized_output_for_asset(asset)
+        asset.normalization_checksum = checksum_for_normalization(asset.normalization)
+        asset.normalization_confirmed = True
+        asset.normalized_export_path = asset.normalized_export_path or ""
+        asset.baseline_y = asset.normalization.baseline_y
+        asset.pivot_x = asset.normalization.pivot_x
+        asset.pivot_y = asset.normalization.pivot_y
+        asset.modified_at = utc_now_iso()
+        self.project.mark_modified()
+        return result
+
+    def export_normalized_asset(self, destination: str | Path, asset_uuid: str | None = None) -> Path:
+        asset = self.get_asset(asset_uuid) if asset_uuid is not None else self.active_asset
+        if asset is None:
+            raise RuntimeError("No active asset")
+        result = self.normalize_active_asset(asset.asset_uuid)
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        result.image.save(destination_path, format="PNG")
+        asset.normalized_export_path = str(destination_path)
+        asset.normalized_exported_at = utc_now_iso()
+        asset.normalization_checksum = result.checksum
+        asset.workflow_status = WorkflowStatus.exported
+        asset.modified_at = utc_now_iso()
+        self.project.log("normalized_export_success", f"Exported normalized {asset.display_name}", asset.asset_uuid)
+        self.project.mark_modified()
+        return destination_path
+
+    def normalized_thumbnail_for_asset(self, asset_uuid: str, size: int = 64) -> Image.Image:
+        asset = self.get_asset(asset_uuid)
+        result = self._normalized_output_for_asset(asset)
+        return normalized_thumbnail(
+            result.image,
+            (asset.normalization.output_width, asset.normalization.output_height),
+            include_canvas=asset.normalization.include_canvas_in_thumbnail,
+            thumbnail_size=size,
+        )
+
+    def thumbnail_for_asset(self, asset_uuid: str, size: int = 64) -> Image.Image:
+        asset = self.get_asset(asset_uuid)
+        if asset.normalized_export_path or asset.normalization.enabled:
+            return self.normalized_thumbnail_for_asset(asset_uuid, size=size)
+        raw_image = self._raw_crop_for_asset(asset)
+        if raw_image is None:
+            raise RuntimeError("Asset has no crop")
+        clean = self._apply_cleaning(raw_image, asset.background_removal)
+        return normalized_thumbnail(clean.cleaned_image, (size, size), include_canvas=False, thumbnail_size=size)
+
+    def _normalized_output_for_asset(self, asset: AssetRecord) -> NormalizedOutputResult:
+        final_image = self._final_image_for_asset(asset)
+        return place_on_canvas(final_image, asset.normalization)
+
+    def asset_normalization_report(self) -> list[dict[str, object]]:
+        return report_rows(self.project.assets)
+
+    def save_normalization_report_csv(self, path: str | Path) -> Path:
+        return report_to_csv(self.asset_normalization_report(), path)
+
+    def save_normalization_report_json(self, path: str | Path) -> Path:
+        return report_to_json(self.asset_normalization_report(), path)
+
     def project_progress_counts(self) -> dict[str, int]:
         counts = {status.value: 0 for status in WorkflowStatus}
         for asset in self.project.assets:
@@ -524,3 +612,65 @@ class ProjectManager:
             base = Path(asset.raw_output_filename).stem
             asset.raw_output_filename = unique_filename(asset.raw_output_filename, filenames)
             asset.clean_output_filename = unique_filename(asset.clean_output_filename, filenames)
+        if not asset.normalization.normalized_output_filename:
+            asset.normalization.normalized_output_filename = generate_normalized_filename(
+                asset.character_group or asset.display_name,
+                asset.category,
+                asset.action or asset.display_name,
+                asset.direction,
+                asset.frame_number,
+                asset.variant,
+                canvas_size=(asset.normalization.output_width, asset.normalization.output_height),
+            )
+
+    def _default_normalization_for_asset(self, asset: AssetRecord) -> NormalizationSettingsModel:
+        settings = NormalizationSettingsModel()
+        if asset.category in {"character", "idle", "walk", "attack", "boss", "enemy", "enemy_small"}:
+            settings.output_width = 48
+            settings.output_height = 48
+            if asset.category in {"enemy_small"}:
+                settings.output_width = 32
+                settings.output_height = 32
+        if asset.category in {"projectile", "effect", "item"}:
+            settings.output_width = 48
+            settings.output_height = 48
+            settings.anchor_mode = "center"
+        if asset.category == "boss":
+            settings.output_width = 64
+            settings.output_height = 64
+        settings.baseline_y = 45 if settings.output_height >= 48 else max(0, settings.output_height - 3)
+        settings.pivot_x = settings.output_width // 2
+        settings.pivot_y = settings.baseline_y
+        settings.normalized_output_filename = generate_normalized_filename(
+            asset.character_group or asset.display_name,
+            asset.category,
+            asset.action or asset.display_name,
+            asset.direction,
+            asset.frame_number,
+            asset.variant,
+            canvas_size=(settings.output_width, settings.output_height),
+        )
+        return settings
+
+    def _final_image_for_asset(self, asset: AssetRecord) -> Image.Image:
+        raw_image = self._raw_crop_for_asset(asset)
+        if raw_image is None:
+            raise RuntimeError("Asset has no raw crop")
+        clean = self._apply_cleaning(raw_image, asset.background_removal)
+        if asset.manual_edit_sidecar:
+            sidecar = Path(asset.manual_edit_sidecar)
+            if self.project.path is not None and not sidecar.is_absolute():
+                sidecar = self.project.path.parent / sidecar
+            validation = validate_manual_sidecar(
+                sidecar,
+                expected_width=raw_image.width,
+                expected_height=raw_image.height,
+                expected_checksum=asset.manual_edit_checksum,
+                expected_source_sheet_checksum=asset.manual_edit_source_sheet_checksum,
+                expected_settings_checksum=asset.manual_edit_cleanup_settings_checksum,
+                actual_source_sheet_checksum=self._source_sheet_checksum_for_asset(asset),
+                actual_settings_checksum=compute_settings_checksum(asset.background_removal.to_dict()),
+            )
+            if validation.valid:
+                return load_sidecar_png(sidecar)
+        return clean.cleaned_image
