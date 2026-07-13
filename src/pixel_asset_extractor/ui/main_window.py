@@ -35,6 +35,8 @@ from ..autosave import autosave_path, has_newer_autosave, recover_autosave, save
 from ..config_store import load_config as load_legacy_config
 from ..exceptions import ConfigError, CropError, ImageLoadError
 from ..image_tools import analyze_image, crop_image, load_png, pil_image_to_qpixmap
+from ..manual_editing import ManualEditDocument, compute_settings_checksum
+from ..manual_storage import load_sidecar_png, manual_edit_sidecar_path, validate_manual_sidecar
 from ..naming import format_frame_number, generate_filename
 from ..processing import (
     BackgroundRemovalResult,
@@ -53,6 +55,7 @@ from ..project_model import ActivityEntry, AssetRecord, BackgroundRemovalSetting
 from ..project_store import build_project_from_legacy_config, load_project as load_sprite_project, save_project as save_sprite_project
 from .canvas_view import ImageCanvasView
 from .dialogs import ActivityLogDialog, AssetDialog
+from .manual_cleanup_widget import ManualCleanupWidget
 from .preview_view import CropPreviewView, PickedColor
 
 
@@ -67,6 +70,7 @@ class MainWindow(QMainWindow):
         self._loaded_images: dict[str, Image.Image] = {}
         self._source_sheet_lookup: dict[str, SourceSheet] = {}
         self._active_sheet_id: str | None = None
+        self._manual_documents: dict[str, ManualEditDocument] = {}
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.timeout.connect(self._refresh_preview)
@@ -78,6 +82,7 @@ class MainWindow(QMainWindow):
         self.canvas = ImageCanvasView()
         self.preview_view = CropPreviewView()
         self.preview_view.set_zoom_percent(100)
+        self.manual_cleanup_widget = ManualCleanupWidget()
 
         self.project_name_label = QLabel("Untitled Project")
         self.source_sheet_combo = QComboBox()
@@ -206,6 +211,7 @@ class MainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self._section("Crop Preview", self._build_preview_section()), 1)
+        right_layout.addWidget(self._section("Manual Cleanup", self.manual_cleanup_widget), 2)
         right_layout.addWidget(self._section("Background Removal", self._build_cleanup_section()))
         right_layout.addWidget(self._section("Comparison Mode", self._build_comparison_section()))
         right_layout.addWidget(self._section("Export Information", self._build_export_section()))
@@ -235,6 +241,7 @@ class MainWindow(QMainWindow):
             ("Delete Asset", self.delete_asset),
             ("Export Raw", self.export_raw),
             ("Export Clean", self.export_clean),
+            ("Export Final", self.export_final),
             ("Open Output Folder", self.open_output_folder),
             ("Create Freya Movement Template", self.create_freya_template),
             ("Activity Log", self.show_activity_log),
@@ -480,17 +487,20 @@ class MainWindow(QMainWindow):
         asset = self._current_asset()
         if asset is None:
             self.preview_view.set_images(None, None)
+            self.manual_cleanup_widget.set_document(None)
             self._update_status_labels()
             return
         raw_image = self._raw_crop_for_asset(asset)
         if raw_image is None:
             self.preview_view.set_images(None, None)
+            self.manual_cleanup_widget.set_document(None)
             self._update_status_labels()
             return
         clean_result = self._apply_cleaning(raw_image, asset.background_removal)
         self.preview_view.set_images(raw_image, clean_result.cleaned_image)
         self.preview_view.set_preview_mode({0: "before", 1: "after", 2: "split"}[self.preview_mode_combo.currentIndex()])
         self.preview_view.set_background_style(self.background_style_combo.currentText(), self.checkerboard_combo.currentText())
+        self.manual_cleanup_widget.set_document(self._manual_document_for_asset(asset, raw_image, clean_result.cleaned_image))
         self._update_status_labels(clean_result)
 
     def _update_status_labels(self, result: BackgroundRemovalResult | None = None) -> None:
@@ -753,6 +763,76 @@ class MainWindow(QMainWindow):
         )
         return apply_background_removal(raw_image, config)
 
+    def _manual_document_for_asset(self, asset: AssetRecord, raw_image: Image.Image, auto_clean: Image.Image) -> ManualEditDocument:
+        existing = self._manual_documents.get(asset.asset_uuid)
+        if existing is not None and existing.size == raw_image.size:
+            final_image = auto_clean
+            if asset.manual_edit_sidecar:
+                sidecar = self._manual_sidecar_for_asset(asset)
+                if sidecar is not None and sidecar.exists():
+                    try:
+                        validation = validate_manual_sidecar(
+                            sidecar,
+                            expected_width=raw_image.width,
+                            expected_height=raw_image.height,
+                            expected_checksum=asset.manual_edit_checksum,
+                            expected_source_sheet_checksum=asset.manual_edit_source_sheet_checksum,
+                            expected_settings_checksum=asset.manual_edit_cleanup_settings_checksum,
+                            actual_source_sheet_checksum=self._source_sheet_checksum_for_asset(asset),
+                            actual_settings_checksum=compute_settings_checksum(asset.background_removal.to_dict()),
+                        )
+                        if validation.valid:
+                            final_image = load_sidecar_png(sidecar)
+                    except Exception:
+                        pass
+            existing.rebase_images(raw_image, auto_clean, final_image, clear_history=False)
+            existing.background_rgba = asset.background_removal.background_rgba
+            existing.cleanup_settings_checksum = compute_settings_checksum(asset.background_removal.to_dict())
+            existing.source_sheet_checksum = self._source_sheet_checksum_for_asset(asset) or ""
+            return existing
+        sidecar = self._manual_sidecar_for_asset(asset)
+        final_image = auto_clean
+        if sidecar is not None and sidecar.exists():
+            try:
+                validation = validate_manual_sidecar(
+                    sidecar,
+                    expected_width=raw_image.width,
+                    expected_height=raw_image.height,
+                    expected_checksum=asset.manual_edit_checksum,
+                    expected_source_sheet_checksum=asset.manual_edit_source_sheet_checksum,
+                    expected_settings_checksum=asset.manual_edit_cleanup_settings_checksum,
+                    actual_source_sheet_checksum=self._source_sheet_checksum_for_asset(asset),
+                    actual_settings_checksum=compute_settings_checksum(asset.background_removal.to_dict()),
+                )
+                if validation.valid:
+                    final_image = load_sidecar_png(sidecar)
+            except Exception:
+                pass
+        document = ManualEditDocument(
+            raw_crop=raw_image,
+            auto_clean=auto_clean,
+            final_edited=final_image,
+            background_rgba=asset.background_removal.background_rgba,
+            cleanup_settings_checksum=compute_settings_checksum(asset.background_removal.to_dict()),
+            source_sheet_checksum=self._source_sheet_checksum_for_asset(asset) or "",
+        )
+        self._manual_documents[asset.asset_uuid] = document
+        return document
+
+    def _manual_sidecar_for_asset(self, asset: AssetRecord) -> Path | None:
+        if asset.manual_edit_sidecar:
+            sidecar = Path(asset.manual_edit_sidecar)
+            if not sidecar.is_absolute() and self.project_path is not None:
+                sidecar = self.project_path.parent / sidecar
+            return sidecar
+        if self.project_path is None:
+            return None
+        return manual_edit_sidecar_path(self.project_path, asset.asset_uuid)
+
+    def _source_sheet_checksum_for_asset(self, asset: AssetRecord) -> str | None:
+        sheet = self._sheet_for_asset(asset)
+        return sheet.checksum if sheet is not None else None
+
     def _background_rgba(self) -> tuple[int, int, int, int] | None:
         asset = self._current_asset()
         if asset is None:
@@ -1004,6 +1084,7 @@ class MainWindow(QMainWindow):
     def _save_to_path(self, path: Path) -> None:
         self.project_manager.project.path = path
         self.project_manager.project.project.project_root_directory = str(path.parent)
+        self._persist_manual_edits(path)
         save_sprite_project(self.project_manager.project, path)
         self.project_path = path
         self.project_manager.project.modified = False
@@ -1019,6 +1100,7 @@ class MainWindow(QMainWindow):
         self.project_manager.new_project("Untitled Project", str(Path.cwd()))
         self.project_path = None
         self._loaded_images.clear()
+        self._manual_documents.clear()
         self._active_sheet_id = None
         self._active_asset_id = None
         self._update_ui_from_project()
@@ -1049,6 +1131,7 @@ class MainWindow(QMainWindow):
             self.project_manager.project = load_sprite_project(path, recover_backup=self._recover_backup_prompt)
         self.project_path = path
         self._loaded_images.clear()
+        self._manual_documents.clear()
         self._update_ui_from_project()
         self.statusBar().showMessage(f"Loaded project: {path}", 4000)
 
@@ -1067,6 +1150,7 @@ class MainWindow(QMainWindow):
         if project.path is None or not project.modified or not project.project.autosave_enabled:
             return
         try:
+            self._persist_manual_edits(project.path)
             save_autosave(project)
         except Exception:
             pass
@@ -1097,6 +1181,40 @@ class MainWindow(QMainWindow):
         if destination is None:
             return
         self._save_export(asset, clean.cleaned_image, destination, "clean")
+
+    def export_final(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        document = self.manual_cleanup_widget.document()
+        if document is None:
+            self._show_error("Nothing to export", "No manual cleanup document is available.")
+            return
+        destination = self._export_destination(asset.clean_output_filename.replace("_clean.png", "_final.png") if asset.clean_output_filename else "crop_final.png", asset.output_folder)
+        if destination is None:
+            return
+        if destination.exists():
+            response = QMessageBox.question(
+                self,
+                "Overwrite file?",
+                f"{destination} already exists. Overwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return
+        document.export_final(destination)
+        asset.export_info.exported_path = str(destination)
+        asset.export_info.exported_at = utc_now_iso()
+        asset.workflow_status = WorkflowStatus.exported
+        asset.modified_at = utc_now_iso()
+        self.project_manager.project.activity_log.append(
+            ActivityEntry(timestamp=utc_now_iso(), event_type="export_success", message=f"Exported {asset.display_name} (final)", asset_uuid=asset.asset_uuid)
+        )
+        self.project_manager.project.activity_log = self.project_manager.project.activity_log[-1000:]
+        self.project_manager.project.mark_modified()
+        self._update_ui_from_project()
+        self.statusBar().showMessage(f"Exported {destination.name}", 4000)
 
     def _export_destination(self, filename: str, output_folder: str) -> Path | None:
         start = Path(output_folder or self.project_manager.project.project.defaults.output_folder or Path.cwd() / "output")
@@ -1152,8 +1270,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self.project_manager.project.modified and self.project_path is not None:
+            self._persist_manual_edits(self.project_path)
             self._maybe_autosave()
         super().closeEvent(event)
+
+    def _persist_manual_edits(self, project_path: Path) -> None:
+        for asset in self.project_manager.project.assets:
+            document = self._manual_documents.get(asset.asset_uuid)
+            if document is None or not document.dirty:
+                continue
+            try:
+                self.project_manager.save_manual_edit_document(asset.asset_uuid, document, project_path)
+            except Exception:
+                continue
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)

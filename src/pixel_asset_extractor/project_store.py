@@ -108,7 +108,7 @@ def build_project_from_legacy_config(config: CropConfig | dict[str, Any], projec
         project=ProjectRecord(
             project_name="Migrated Project",
             project_root_directory=project_root,
-            project_version=3,
+            project_version=4,
             created_at=utc_now_iso(),
             modified_at=utc_now_iso(),
         ),
@@ -164,7 +164,7 @@ def _load_project_file(path: Path) -> SpriteProject:
         raise ConfigError(f"Malformed project file: {path}")
 
     config_version = int(payload.get("config_version", payload.get("version", 1)))
-    if config_version == 3 and "project" in payload:
+    if config_version in (3, 4) and "project" in payload:
         return _load_v3_project(payload, path)
     if config_version in (1, 2) or {"crop_rect", "x", "y", "width", "height"} & payload.keys():
         legacy = load_legacy_config(path)
@@ -189,6 +189,7 @@ def _load_v3_project(payload: dict[str, Any], path: Path) -> SpriteProject:
         for key, value in payload.items()
         if key not in {"config_version", "project", "source_sheets", "assets", "activity_log"}
     }
+    project.project_version = 4
     return SpriteProject(
         project=project,
         source_sheets=source_sheet_records,

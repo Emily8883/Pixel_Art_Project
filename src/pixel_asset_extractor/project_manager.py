@@ -10,6 +10,12 @@ from PIL import Image
 
 from .config_store import load_config as load_legacy_config
 from .image_tools import crop_image
+from .manual_editing import ManualEditDocument, compute_settings_checksum
+from .manual_storage import (
+    manual_edit_sidecar_path,
+    save_sidecar_png,
+    validate_manual_sidecar,
+)
 from .naming import format_frame_number, generate_filename, unique_filename
 from .processing import BackgroundRemovalSettings, apply_background_removal, ui_tolerance_to_distance
 from .project_model import (
@@ -257,6 +263,7 @@ class ProjectManager:
         notes: str | None = None,
     ) -> AssetRecord:
         asset = self.get_asset(asset_uuid)
+        manual_invalidated = False
         if asset.workflow_status == WorkflowStatus.reviewed and any(
             value is not None
             for value in (
@@ -274,17 +281,22 @@ class ProjectManager:
             asset.workflow_status = WorkflowStatus.needs_revision
         if crop_rect is not None:
             asset.crop_rect = crop_rect
+            manual_invalidated = True
             if asset.workflow_status == WorkflowStatus.planned:
                 asset.workflow_status = WorkflowStatus.cropped
         if background_rgba is not None:
             asset.background_removal.background_rgba = background_rgba
+            manual_invalidated = True
         if tolerance_ui is not None:
             asset.background_removal.tolerance_ui = int(tolerance_ui)
             asset.background_removal.tolerance_threshold = ui_tolerance_to_distance(int(tolerance_ui))
+            manual_invalidated = True
         if connected_background_only is not None:
             asset.background_removal.connected_background_only = bool(connected_background_only)
+            manual_invalidated = True
         if connectivity is not None:
             asset.background_removal.connectivity = 8 if int(connectivity) == 8 else 4
+            manual_invalidated = True
         if raw_output_filename is not None:
             asset.raw_output_filename = raw_output_filename
         if clean_output_filename is not None:
@@ -293,10 +305,64 @@ class ProjectManager:
             asset.output_folder = output_folder
         if notes is not None:
             asset.notes = notes
+        if manual_invalidated:
+            self.invalidate_manual_edits(asset_uuid, "cleanup_or_crop_changed")
         asset.modified_at = utc_now_iso()
         self._refresh_asset_filenames(asset)
         self.project.mark_modified()
         return asset
+
+    def invalidate_manual_edits(self, asset_uuid: str, reason: str = "manual_edits_invalidated") -> None:
+        asset = self.get_asset(asset_uuid)
+        asset.manual_edit_sidecar = ""
+        asset.manual_edit_checksum = None
+        asset.manual_edit_width = None
+        asset.manual_edit_height = None
+        asset.manual_edit_source_sheet_checksum = None
+        asset.manual_edit_cleanup_settings_checksum = None
+        asset.manual_edit_modified_at = utc_now_iso()
+        self.project.log(reason, f"Manual edits cleared for {asset.display_name}", asset_uuid)
+
+    def save_manual_edit_document(self, asset_uuid: str, document: ManualEditDocument, project_path: str | Path | None = None) -> Path:
+        asset = self.get_asset(asset_uuid)
+        project_path = Path(project_path or self.project.path or Path.cwd() / "project.json")
+        destination = manual_edit_sidecar_path(project_path, asset_uuid)
+        save_sidecar_png(document, destination)
+        document.mark_clean()
+        asset.manual_edit_sidecar = str(destination.relative_to(project_path.parent)) if destination.is_relative_to(project_path.parent) else str(destination)
+        asset.manual_edit_checksum = document.checksum()
+        asset.manual_edit_width, asset.manual_edit_height = document.size
+        asset.manual_edit_source_sheet_checksum = self._source_sheet_checksum_for_asset(asset)
+        asset.manual_edit_cleanup_settings_checksum = compute_settings_checksum(asset.background_removal.to_dict())
+        asset.manual_edit_modified_at = utc_now_iso()
+        self.project.log("manual_edit_saved", f"Saved manual edits for {asset.display_name}", asset_uuid)
+        self.project.mark_modified()
+        return destination
+
+    def manual_edit_validation(self, asset_uuid: str, project_path: str | Path | None = None):
+        asset = self.get_asset(asset_uuid)
+        project_path = Path(project_path or self.project.path or Path.cwd() / "project.json")
+        if not asset.manual_edit_sidecar:
+            return None
+        sidecar = Path(asset.manual_edit_sidecar)
+        if not sidecar.is_absolute():
+            sidecar = project_path.parent / sidecar
+        return validate_manual_sidecar(
+            sidecar,
+            expected_width=asset.manual_edit_width or (asset.crop_rect.width if asset.crop_rect else 0),
+            expected_height=asset.manual_edit_height or (asset.crop_rect.height if asset.crop_rect else 0),
+            expected_checksum=asset.manual_edit_checksum,
+            expected_source_sheet_checksum=asset.manual_edit_source_sheet_checksum,
+            expected_settings_checksum=asset.manual_edit_cleanup_settings_checksum,
+            actual_source_sheet_checksum=self._source_sheet_checksum_for_asset(asset),
+            actual_settings_checksum=compute_settings_checksum(asset.background_removal.to_dict()),
+        )
+
+    def _source_sheet_checksum_for_asset(self, asset: AssetRecord) -> str | None:
+        sheet = next((item for item in self.project.source_sheets if item.source_sheet_id == asset.source_sheet_id), None)
+        if sheet is None:
+            return None
+        return sheet.checksum
 
     def apply_crop_to_active_asset(self, crop_rect) -> None:
         asset = self.active_asset

@@ -182,6 +182,13 @@ class AssetRecord:
     created_at: str = field(default_factory=utc_now_iso)
     modified_at: str = field(default_factory=utc_now_iso)
     export_info: ExportInfo = field(default_factory=ExportInfo)
+    manual_edit_sidecar: str = ""
+    manual_edit_checksum: str | None = None
+    manual_edit_width: int | None = None
+    manual_edit_height: int | None = None
+    manual_edit_source_sheet_checksum: str | None = None
+    manual_edit_cleanup_settings_checksum: str | None = None
+    manual_edit_modified_at: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, project_dir: Path | None = None) -> dict[str, Any]:
@@ -206,6 +213,13 @@ class AssetRecord:
             "created_at": self.created_at,
             "modified_at": self.modified_at,
             "export_info": self.export_info.to_dict(project_dir),
+            "manual_edit_sidecar": self.manual_edit_sidecar,
+            "manual_edit_checksum": self.manual_edit_checksum,
+            "manual_edit_width": self.manual_edit_width,
+            "manual_edit_height": self.manual_edit_height,
+            "manual_edit_source_sheet_checksum": self.manual_edit_source_sheet_checksum,
+            "manual_edit_cleanup_settings_checksum": self.manual_edit_cleanup_settings_checksum,
+            "manual_edit_modified_at": self.manual_edit_modified_at,
         }
         if project_dir is not None:
             data["source_sheet_path"] = _serialize_path(self.source_sheet_path, project_dir)
@@ -240,6 +254,13 @@ class AssetRecord:
                 "created_at",
                 "modified_at",
                 "export_info",
+                "manual_edit_sidecar",
+                "manual_edit_checksum",
+                "manual_edit_width",
+                "manual_edit_height",
+                "manual_edit_source_sheet_checksum",
+                "manual_edit_cleanup_settings_checksum",
+                "manual_edit_modified_at",
             }
         }
         source_sheet_path = str(payload.get("source_sheet_path", ""))
@@ -272,6 +293,13 @@ class AssetRecord:
             created_at=str(payload.get("created_at", utc_now_iso())),
             modified_at=str(payload.get("modified_at", utc_now_iso())),
             export_info=ExportInfo.from_dict(payload.get("export_info", {}), project_dir),
+            manual_edit_sidecar=str(payload.get("manual_edit_sidecar", "")),
+            manual_edit_checksum=payload.get("manual_edit_checksum"),
+            manual_edit_width=_maybe_int(payload.get("manual_edit_width")),
+            manual_edit_height=_maybe_int(payload.get("manual_edit_height")),
+            manual_edit_source_sheet_checksum=payload.get("manual_edit_source_sheet_checksum"),
+            manual_edit_cleanup_settings_checksum=payload.get("manual_edit_cleanup_settings_checksum"),
+            manual_edit_modified_at=payload.get("manual_edit_modified_at"),
             extras=extras,
         )
 
@@ -298,7 +326,7 @@ class ProjectDefaults:
 class ProjectRecord:
     project_name: str
     project_root_directory: str
-    project_version: int = 3
+    project_version: int = 4
     created_at: str = field(default_factory=utc_now_iso)
     modified_at: str = field(default_factory=utc_now_iso)
     notes: str = ""
@@ -348,7 +376,7 @@ class ProjectRecord:
         return cls(
             project_name=str(payload.get("project_name", "Untitled Project")),
             project_root_directory=project_root_directory,
-            project_version=int(payload.get("project_version", 3)),
+            project_version=int(payload.get("project_version", 4)),
             created_at=str(payload.get("created_at", utc_now_iso())),
             modified_at=str(payload.get("modified_at", utc_now_iso())),
             notes=str(payload.get("notes", "")),
@@ -372,7 +400,7 @@ class SpriteProject:
     def to_dict(self) -> dict[str, Any]:
         project_dir = self.path.parent if self.path else None
         payload = {
-            "config_version": 3,
+            "config_version": 4,
             "project": self.project.to_dict(project_dir),
             "source_sheets": [sheet.to_dict(project_dir) for sheet in self.source_sheets],
             "assets": [asset.to_dict(project_dir) for asset in self.assets],
