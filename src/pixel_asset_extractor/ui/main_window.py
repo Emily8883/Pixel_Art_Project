@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QModelIndex, QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -56,6 +56,7 @@ from ..project_store import build_project_from_legacy_config, load_project as lo
 from .canvas_view import ImageCanvasView
 from .dialogs import ActivityLogDialog, AssetDialog
 from .manual_cleanup_widget import ManualCleanupWidget
+from .normalization_panel import CompareAlignmentDialog, NormalizationInspectorWidget, NormalizationReportDialog
 from .preview_view import CropPreviewView, PickedColor
 
 
@@ -83,6 +84,10 @@ class MainWindow(QMainWindow):
         self.preview_view = CropPreviewView()
         self.preview_view.set_zoom_percent(100)
         self.manual_cleanup_widget = ManualCleanupWidget()
+        self.normalization_widget = NormalizationInspectorWidget()
+        self.normalization_widget.changed.connect(self._schedule_preview_refresh)
+        self.normalization_widget.compareRequested.connect(self._open_compare_alignment)
+        self.normalization_widget.exportRequested.connect(self.export_normalized)
 
         self.project_name_label = QLabel("Untitled Project")
         self.source_sheet_combo = QComboBox()
@@ -191,6 +196,7 @@ class MainWindow(QMainWindow):
 
         self._build_layout()
         self._build_toolbar()
+        self._build_menus()
         self._build_shortcuts()
 
         self.canvas.cropChanged.connect(self._on_canvas_crop_changed)
@@ -214,6 +220,7 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self._section("Crop Preview", self._build_preview_section()), 1)
         right_layout.addWidget(self._section("Manual Cleanup", self.manual_cleanup_widget), 2)
+        right_layout.addWidget(self._section("Normalization", self.normalization_widget), 3)
         right_layout.addWidget(self._section("Background Removal", self._build_cleanup_section()))
         right_layout.addWidget(self._section("Comparison Mode", self._build_comparison_section()))
         right_layout.addWidget(self._section("Export Information", self._build_export_section()))
@@ -253,6 +260,15 @@ class MainWindow(QMainWindow):
             action = QAction(text, self)
             action.triggered.connect(slot)
             toolbar.addAction(action)
+
+    def _build_menus(self) -> None:
+        project_menu = self.menuBar().addMenu("Project")
+        report_action = QAction("Normalization Report", self)
+        report_action.triggered.connect(self._open_normalization_report)
+        project_menu.addAction(report_action)
+        compare_action = QAction("Compare Alignment", self)
+        compare_action.triggered.connect(self._open_compare_alignment)
+        project_menu.addAction(compare_action)
 
     def _build_shortcuts(self) -> None:
         shortcuts = [
@@ -368,7 +384,6 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.pick_background_button)
         buttons.addWidget(self.reset_background_button)
         buttons.addWidget(self.regenerate_filename_button)
-        buttons.addWidget(self.export_normalized_button)
         layout.addLayout(buttons)
         layout.addWidget(self.background_swatch)
         layout.addWidget(self.rgb_label)
@@ -492,12 +507,14 @@ class MainWindow(QMainWindow):
         if asset is None:
             self.preview_view.set_images(None, None)
             self.manual_cleanup_widget.set_document(None)
+            self.normalization_widget.set_context(self.project_manager, None, self.project_path)
             self._update_status_labels()
             return
         raw_image = self._raw_crop_for_asset(asset)
         if raw_image is None:
             self.preview_view.set_images(None, None)
             self.manual_cleanup_widget.set_document(None)
+            self.normalization_widget.set_context(self.project_manager, asset, self.project_path)
             self._update_status_labels()
             return
         clean_result = self._apply_cleaning(raw_image, asset.background_removal)
@@ -505,6 +522,7 @@ class MainWindow(QMainWindow):
         self.preview_view.set_preview_mode({0: "before", 1: "after", 2: "split"}[self.preview_mode_combo.currentIndex()])
         self.preview_view.set_background_style(self.background_style_combo.currentText(), self.checkerboard_combo.currentText())
         self.manual_cleanup_widget.set_document(self._manual_document_for_asset(asset, raw_image, clean_result.cleaned_image))
+        self.normalization_widget.set_context(self.project_manager, asset, self.project_path)
         self._update_status_labels(clean_result)
 
     def _update_status_labels(self, result: BackgroundRemovalResult | None = None) -> None:
@@ -1244,6 +1262,23 @@ class MainWindow(QMainWindow):
             return
         self.project_manager.export_normalized_asset(destination, asset.asset_uuid)
         self._update_ui_from_project()
+
+    def _open_normalization_report(self) -> None:
+        rows = self.project_manager.asset_normalization_report()
+        dialog = NormalizationReportDialog(rows, self)
+        dialog.exec()
+
+    def _open_compare_alignment(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        group_assets = [
+            item
+            for item in self.project_manager.project.assets
+            if item.alignment_group == asset.alignment_group or item.character_group == asset.character_group
+        ]
+        dialog = CompareAlignmentDialog(group_assets, self)
+        dialog.exec()
 
     def _export_destination(self, filename: str, output_folder: str) -> Path | None:
         start = Path(output_folder or self.project_manager.project.project.defaults.output_folder or Path.cwd() / "output")

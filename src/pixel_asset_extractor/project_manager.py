@@ -9,7 +9,7 @@ import shutil
 from PIL import Image
 
 from .config_store import load_config as load_legacy_config
-from .image_tools import crop_image
+from .image_tools import crop_image, load_png
 from .manual_editing import ManualEditDocument, compute_settings_checksum
 from .manual_storage import load_sidecar_png, validate_manual_sidecar
 from .normalization import (
@@ -386,6 +386,27 @@ class ProjectManager:
         if sheet is None:
             return None
         return sheet.checksum
+
+    def _raw_crop_for_asset(self, asset: AssetRecord) -> Image.Image | None:
+        sheet = next((item for item in self.project.source_sheets if item.source_sheet_id == asset.source_sheet_id), None)
+        if sheet is None or not sheet.path or asset.crop_rect is None:
+            return None
+        sheet_path = Path(sheet.path)
+        if self.project.path is not None and not sheet_path.is_absolute():
+            sheet_path = self.project.path.parent / sheet_path
+        if not sheet_path.exists():
+            return None
+        image = load_png(sheet_path)
+        return crop_image(image, asset.crop_rect)
+
+    def _apply_cleaning(self, raw_image: Image.Image, settings: BackgroundRemovalSettingsModel):
+        config = BackgroundRemovalSettings(
+            background_rgba=settings.background_rgba,
+            tolerance_ui=settings.tolerance_ui,
+            connected_background_only=settings.connected_background_only,
+            connectivity=settings.connectivity,
+        )
+        return apply_background_removal(raw_image, config)
 
     def apply_crop_to_active_asset(self, crop_rect) -> None:
         asset = self.active_asset
