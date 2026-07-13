@@ -1,197 +1,222 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QEvent, QModelIndex, QPointF, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
+    QSplitter,
     QSlider,
     QSpinBox,
-    QSplitter,
+    QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from ..config_store import load_config, save_config
+from ..autosave import autosave_path, has_newer_autosave, recover_autosave, save_autosave
+from ..config_store import load_config as load_legacy_config
 from ..exceptions import ConfigError, CropError, ImageLoadError
-from ..image_tools import analyze_image, load_png
-from ..models import CropConfig, CropRect
+from ..image_tools import analyze_image, crop_image, load_png, pil_image_to_qpixmap
+from ..naming import format_frame_number, generate_filename
 from ..processing import (
     BackgroundRemovalResult,
     BackgroundRemovalSettings,
     apply_background_removal,
     clamp_int,
-    crop_image,
+    export_png,
     format_hex,
     format_rgb,
     format_rgba,
-    export_png,
     removal_warning_messages,
     ui_tolerance_to_distance,
 )
+from ..project_manager import ProjectManager
+from ..project_model import ActivityEntry, AssetRecord, BackgroundRemovalSettingsModel, SourceSheet, WorkflowStatus, utc_now_iso
+from ..project_store import build_project_from_legacy_config, load_project as load_sprite_project, save_project as save_sprite_project
 from .canvas_view import ImageCanvasView
+from .dialogs import ActivityLogDialog, AssetDialog
 from .preview_view import CropPreviewView, PickedColor
-
-
-@dataclass(frozen=True, slots=True)
-class EditorSnapshot:
-    background_rgba: tuple[int, int, int, int] | None
-    tolerance_ui: int
-    connected_background_only: bool
-    connectivity: int
-    preview_mode: str
-    background_style: str
-    checkerboard_size: str
-    output_raw_filename: str
-    output_clean_filename: str
-    last_export_directory: str | None
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Pixel Asset Extractor")
-        self.resize(1700, 1000)
+        self.resize(1900, 1100)
 
-        self._source_path: Path | None = None
-        self._source_image: Image.Image | None = None
-        self._raw_crop: Image.Image | None = None
-        self._clean_crop: Image.Image | None = None
-        self._crop_rect: CropRect | None = None
-        self._removal_result: BackgroundRemovalResult | None = None
-        self._history: list[EditorSnapshot] = []
-        self._history_index = -1
-        self._last_export_directory: str | None = None
-        self._eyedropper_active = False
-        self._shortcuts: list[QShortcut] = []
+        self.project_manager = ProjectManager()
+        self.project_path: Path | None = None
+        self._loaded_images: dict[str, Image.Image] = {}
+        self._source_sheet_lookup: dict[str, SourceSheet] = {}
+        self._active_sheet_id: str | None = None
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.timeout.connect(self._refresh_preview)
 
-        self._background_rgba: tuple[int, int, int, int] | None = None
-        self._tolerance_ui = 5
-        self._connected_background_only = True
-        self._connectivity = 4
-        self._preview_mode = "after"
-        self._background_style = "checkerboard"
-        self._checkerboard_size = "medium"
-        self._output_raw_filename = ""
-        self._output_clean_filename = ""
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)
+        self._autosave_timer.timeout.connect(self._maybe_autosave)
 
         self.canvas = ImageCanvasView()
         self.preview_view = CropPreviewView()
         self.preview_view.set_zoom_percent(100)
-        self.preview_view.set_preview_mode(self._preview_mode)
 
+        self.project_name_label = QLabel("Untitled Project")
+        self.source_sheet_combo = QComboBox()
+        self.source_sheet_combo.currentIndexChanged.connect(self._on_source_sheet_selected)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search assets")
+        self.search_edit.textChanged.connect(self._refresh_asset_list)
+        self.group_filter = QComboBox()
+        self.group_filter.addItem("All groups")
+        self.group_filter.currentTextChanged.connect(self._refresh_asset_list)
+        self.category_filter = QComboBox()
+        self.category_filter.addItem("All categories")
+        self.category_filter.currentTextChanged.connect(self._refresh_asset_list)
+        self.direction_filter = QComboBox()
+        self.direction_filter.addItem("All directions")
+        self.direction_filter.currentTextChanged.connect(self._refresh_asset_list)
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("All statuses")
+        self.status_filter.currentTextChanged.connect(self._refresh_asset_list)
+
+        self.asset_list = QListWidget()
+        self.asset_list.itemSelectionChanged.connect(self._on_asset_selection_changed)
+        self.asset_list.installEventFilter(self)
+
+        self.progress_label = QLabel("Project Progress: 0 / 0 exported")
+        self.group_progress_label = QLabel("Group Progress: 0 / 0 exported")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+
+        self.preview_mode_combo = QComboBox()
+        self.preview_mode_combo.addItems(["Before", "After", "Split"])
+        self.preview_mode_combo.currentIndexChanged.connect(self._on_preview_mode_changed)
         self.preview_zoom_spin = QSpinBox()
         self.preview_zoom_spin.setRange(25, 3200)
         self.preview_zoom_spin.setSuffix("%")
         self.preview_zoom_spin.setValue(100)
         self.preview_zoom_spin.valueChanged.connect(self.preview_view.set_zoom_percent)
-        self.preview_view.zoomChanged.connect(self._sync_preview_zoom_spin)
-
-        self.preview_mode_combo = QComboBox()
-        self.preview_mode_combo.addItems(["Before", "After", "Split"])
-        self.preview_mode_combo.currentIndexChanged.connect(self._on_preview_mode_changed)
+        self.preview_view.zoomChanged.connect(self._sync_preview_zoom)
 
         self.background_style_combo = QComboBox()
         self.background_style_combo.addItems(["checkerboard", "white", "black", "bright red", "bright green"])
-        self.background_style_combo.currentTextChanged.connect(self._on_preview_style_changed)
-
-        self.checker_size_combo = QComboBox()
-        self.checker_size_combo.addItems(["small", "medium", "large"])
-        self.checker_size_combo.currentTextChanged.connect(self._on_preview_style_changed)
+        self.background_style_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+        self.checkerboard_combo = QComboBox()
+        self.checkerboard_combo.addItems(["small", "medium", "large"])
+        self.checkerboard_combo.currentTextChanged.connect(self._schedule_preview_refresh)
 
         self.pick_background_button = QPushButton("Pick Background Color")
-        self.pick_background_button.clicked.connect(self.start_eyedropper)
-
-        self.reset_button = QPushButton("Reset Background Removal")
-        self.reset_button.clicked.connect(self.reset_background_removal)
+        self.pick_background_button.clicked.connect(self._start_eyedropper)
+        self.reset_background_button = QPushButton("Reset Background Removal")
+        self.reset_background_button.clicked.connect(self._reset_background_removal)
+        self.regenerate_filename_button = QPushButton("Regenerate Filename")
+        self.regenerate_filename_button.clicked.connect(self._regenerate_filename)
 
         self.tolerance_slider = QSlider(Qt.Orientation.Horizontal)
         self.tolerance_slider.setRange(0, 100)
-        self.tolerance_slider.setValue(self._tolerance_ui)
+        self.tolerance_slider.setValue(5)
         self.tolerance_slider.valueChanged.connect(self._on_tolerance_changed)
-
         self.tolerance_spin = QSpinBox()
         self.tolerance_spin.setRange(0, 100)
-        self.tolerance_spin.setValue(self._tolerance_ui)
+        self.tolerance_spin.setValue(5)
         self.tolerance_spin.valueChanged.connect(self._on_tolerance_changed)
-
         self.connected_only_checkbox = QCheckBox("Remove connected background only")
         self.connected_only_checkbox.setChecked(True)
-        self.connected_only_checkbox.toggled.connect(self._on_connected_mode_changed)
-
+        self.connected_only_checkbox.toggled.connect(self._schedule_preview_refresh)
         self.connectivity_checkbox = QCheckBox("Use 8-way connectivity")
         self.connectivity_checkbox.setChecked(False)
-        self.connectivity_checkbox.toggled.connect(self._on_connectivity_changed)
+        self.connectivity_checkbox.toggled.connect(self._schedule_preview_refresh)
 
         self.background_swatch = QLabel()
         self.background_swatch.setFixedSize(48, 24)
         self.background_swatch.setStyleSheet("background: transparent; border: 1px solid #666;")
-
         self.rgb_label = QLabel("RGB: not selected")
         self.rgba_label = QLabel("RGBA: not selected")
         self.hex_label = QLabel("Hex: not selected")
-        self.color_pick_status = QLabel("No background color selected.")
-
-        self.crop_status_label = QLabel("Crop rectangle: none")
-        self.raw_dimensions_label = QLabel("Raw crop dimensions: none")
-        self.removed_pixels_label = QLabel("Removed pixels: 0")
-        self.removed_percentage_label = QLabel("Removed: 0.0%")
-        self.export_mode_label = QLabel("Export mode: raw + clean")
-        self.zoom_label = QLabel("Current zoom: 100%")
         self.warning_label = QLabel("")
         self.warning_label.setWordWrap(True)
         self.warning_label.setStyleSheet("color: #c0392b; font-weight: 600;")
 
+        self.crop_status_label = QLabel("Crop rectangle: none")
+        self.dimensions_label = QLabel("Raw crop dimensions: none")
+        self.removed_pixels_label = QLabel("Removed pixels: 0")
+        self.removed_percentage_label = QLabel("Removed: 0.0%")
+        self.export_mode_label = QLabel("Export mode: raw + clean")
+        self.zoom_status_label = QLabel("Current zoom: 100%")
+        self.source_sheet_label = QLabel("No source sheets loaded")
+        self.source_image_info_label = QLabel("Source sheet info unavailable.")
+        self.source_image_info_label.setWordWrap(True)
+        self.activity_summary_label = QLabel("")
+        self.activity_summary_label.setWordWrap(True)
+        self.project_notes_edit = QTextEdit()
+        self.project_notes_edit.setPlaceholderText("Project notes")
+        self.project_notes_edit.textChanged.connect(self._on_notes_changed)
+
         self.raw_filename_edit = QLineEdit()
-        self.raw_filename_edit.setPlaceholderText("raw filename")
-        self.raw_filename_edit.textChanged.connect(self._on_export_name_changed)
-
+        self.raw_filename_edit.textChanged.connect(self._on_filename_edited)
         self.clean_filename_edit = QLineEdit()
-        self.clean_filename_edit.setPlaceholderText("clean filename")
-        self.clean_filename_edit.textChanged.connect(self._on_export_name_changed)
+        self.clean_filename_edit.textChanged.connect(self._on_filename_edited)
+        self.output_folder_edit = QLineEdit()
+        self.output_folder_edit.textChanged.connect(self._on_output_folder_changed)
 
-        self.export_directory_label = QLabel("Last export directory: not set")
-        self.project_info_label = QLabel("Load a PNG reference sheet to begin.")
-        self.project_info_label.setWordWrap(True)
+        self._active_asset_id: str | None = None
+        self._eyedropper_active = False
+        self._editing_programmatically = False
 
         self._build_layout()
         self._build_toolbar()
         self._build_shortcuts()
 
-        self.canvas.cropChanged.connect(self._on_crop_changed)
-        self.preview_view.colorPicked.connect(self._on_preview_color_picked)
+        self.canvas.cropChanged.connect(self._on_canvas_crop_changed)
+        self.preview_view.colorPicked.connect(self._on_color_picked)
 
-        self._update_ui_from_state()
-        self._push_history(reset=True)
+        self._update_ui_from_project()
+        self._autosave_timer.start()
 
     def _build_layout(self) -> None:
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addWidget(self._section("Project", self._build_project_panel()))
+        left_layout.addWidget(self._section("Assets", self._build_asset_panel()), 1)
+        left_layout.addWidget(self._section("Progress", self._build_progress_panel()))
+
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.addWidget(self.canvas)
+
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        right_layout.addWidget(self._section_widget("Crop Preview", self._build_preview_section()))
-        right_layout.addWidget(self._section_widget("Background Removal", self._build_background_section()))
-        right_layout.addWidget(self._section_widget("Comparison Mode", self._build_comparison_section()))
-        right_layout.addWidget(self._section_widget("Export Information", self._build_export_section()))
-        right_layout.addStretch(1)
+        right_layout.addWidget(self._section("Crop Preview", self._build_preview_section()), 1)
+        right_layout.addWidget(self._section("Background Removal", self._build_cleanup_section()))
+        right_layout.addWidget(self._section("Comparison Mode", self._build_comparison_section()))
+        right_layout.addWidget(self._section("Export Information", self._build_export_section()))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.canvas)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(center_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("Ready")
 
@@ -201,563 +226,884 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         actions = [
-            ("Open PNG", self.open_png),
+            ("New Project", self.new_project),
+            ("Open Project", self.open_project),
             ("Save Project", self.save_project),
-            ("Load Project", self.load_project),
-            ("Undo", self.undo),
-            ("Redo", self.redo),
+            ("Save Project As", self.save_project_as),
+            ("Add Asset", self.add_asset),
+            ("Duplicate Asset", self.duplicate_asset),
+            ("Delete Asset", self.delete_asset),
             ("Export Raw", self.export_raw),
             ("Export Clean", self.export_clean),
+            ("Open Output Folder", self.open_output_folder),
+            ("Create Freya Movement Template", self.create_freya_template),
+            ("Activity Log", self.show_activity_log),
         ]
         for text, slot in actions:
             action = QAction(text, self)
             action.triggered.connect(slot)
             toolbar.addAction(action)
 
-        toolbar.addSeparator()
-        toolbar.addWidget(self.preview_zoom_spin)
-
     def _build_shortcuts(self) -> None:
-        self._shortcuts.append(QShortcut(QKeySequence.StandardKey.Undo, self, self.undo))
-        self._shortcuts.append(QShortcut(QKeySequence.StandardKey.Redo, self, self.redo))
-        self._shortcuts.append(QShortcut(QKeySequence("Esc"), self, self.cancel_eyedropper))
+        shortcuts = [
+            (QKeySequence("Ctrl+N"), self.new_project),
+            (QKeySequence("Ctrl+O"), self.open_project),
+            (QKeySequence("Ctrl+S"), self.save_project),
+            (QKeySequence("Ctrl+Shift+S"), self.save_project_as),
+            (QKeySequence("Ctrl+Alt+A"), self.add_asset),
+            (QKeySequence("Ctrl+D"), self.duplicate_asset),
+            (QKeySequence("Ctrl+F"), self.search_edit.setFocus),
+            (QKeySequence("Ctrl+E"), self.export_clean),
+            (QKeySequence("Ctrl+Shift+E"), self.export_raw),
+            (QKeySequence.StandardKey.Undo, self.undo),
+            (QKeySequence.StandardKey.Redo, self.redo),
+        ]
+        self._shortcuts = [QShortcut(sequence, self, slot) for sequence, slot in shortcuts]
+        self._delete_shortcut = QShortcut(QKeySequence("Delete"), self)
+        self._delete_shortcut.activated.connect(self._on_delete_shortcut)
 
-    def _section_widget(self, title: str, content: QWidget) -> QGroupBox:
+    def _section(self, title: str, widget: QWidget, stretch: int = 0) -> QGroupBox:
         box = QGroupBox(title)
         layout = QVBoxLayout(box)
-        layout.addWidget(content)
+        layout.addWidget(widget, stretch)
         return box
+
+    def _build_project_panel(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        layout.addWidget(QLabel("Project Name"))
+        layout.addWidget(self.project_name_label)
+
+        buttons = QHBoxLayout()
+        for text, slot in [
+            ("Add Source Sheet", self.add_source_sheet),
+            ("Remove Source Sheet", self.remove_source_sheet),
+            ("Rename Label", self.rename_source_sheet_label),
+            ("Relink Source", self.relink_source_sheet),
+        ]:
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+
+        layout.addWidget(QLabel("Source Sheet"))
+        layout.addWidget(self.source_sheet_combo)
+        layout.addWidget(self.source_sheet_label)
+        layout.addWidget(self.source_image_info_label)
+
+        layout.addWidget(QLabel("Search"))
+        layout.addWidget(self.search_edit)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(self.group_filter)
+        filter_row.addWidget(self.category_filter)
+        filter_row.addWidget(self.direction_filter)
+        filter_row.addWidget(self.status_filter)
+        layout.addLayout(filter_row)
+
+        layout.addWidget(self.asset_list, 1)
+        layout.addWidget(self.activity_summary_label)
+        return widget
+
+    def _build_asset_panel(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        row = QHBoxLayout()
+        for text, slot in [
+            ("Add Asset", self.add_asset),
+            ("Duplicate", self.duplicate_asset),
+            ("Delete", self.delete_asset),
+            ("Move Up", lambda: self.move_asset(-1)),
+            ("Move Down", lambda: self.move_asset(1)),
+        ]:
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        layout.addLayout(row)
+        for text, slot in [
+            ("Mark Reviewed", lambda: self._mark_status(WorkflowStatus.reviewed)),
+            ("Mark Needs Revision", lambda: self._mark_status(WorkflowStatus.needs_revision)),
+        ]:
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+        return widget
+
+    def _build_progress_panel(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.group_progress_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.project_notes_edit)
+        return widget
 
     def _build_preview_section(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Mode"))
-        controls.addWidget(self.preview_mode_combo)
-        controls.addWidget(QLabel("Zoom"))
-        controls.addWidget(self.preview_zoom_spin)
-        layout.addLayout(controls)
-
+        control_row = QHBoxLayout()
+        control_row.addWidget(QLabel("Mode"))
+        control_row.addWidget(self.preview_mode_combo)
+        control_row.addWidget(QLabel("Zoom"))
+        control_row.addWidget(self.preview_zoom_spin)
+        layout.addLayout(control_row)
         layout.addWidget(self.preview_view, 1)
         return widget
 
-    def _build_background_section(self) -> QWidget:
+    def _build_cleanup_section(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-
-        color_row = QHBoxLayout()
-        color_row.addWidget(self.pick_background_button)
-        color_row.addWidget(self.reset_button)
-        layout.addLayout(color_row)
-
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.pick_background_button)
+        buttons.addWidget(self.reset_background_button)
+        buttons.addWidget(self.regenerate_filename_button)
+        layout.addLayout(buttons)
         layout.addWidget(self.background_swatch)
         layout.addWidget(self.rgb_label)
         layout.addWidget(self.rgba_label)
         layout.addWidget(self.hex_label)
-        layout.addWidget(self.color_pick_status)
-
-        tolerance_row = QHBoxLayout()
-        tolerance_row.addWidget(QLabel("Tolerance"))
-        tolerance_row.addWidget(self.tolerance_slider, 1)
-        tolerance_row.addWidget(self.tolerance_spin)
-        layout.addLayout(tolerance_row)
-
+        layout.addWidget(self.tolerance_slider)
+        layout.addWidget(self.tolerance_spin)
         layout.addWidget(self.connected_only_checkbox)
         layout.addWidget(self.connectivity_checkbox)
-
-        self.tolerance_threshold_label = QLabel("Threshold: 0.00")
-        layout.addWidget(self.tolerance_threshold_label)
+        layout.addWidget(QLabel("Warnings"))
+        layout.addWidget(self.warning_label)
         return widget
 
     def _build_comparison_section(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-
         layout.addWidget(QLabel("Preview backgrounds"))
         layout.addWidget(self.background_style_combo)
         layout.addWidget(QLabel("Checkerboard size"))
-        layout.addWidget(self.checker_size_combo)
+        layout.addWidget(self.checkerboard_combo)
         return widget
 
     def _build_export_section(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-
         form = QFormLayout()
         form.addRow("Raw filename", self.raw_filename_edit)
         form.addRow("Clean filename", self.clean_filename_edit)
+        form.addRow("Output folder", self.output_folder_edit)
         layout.addLayout(form)
-
         layout.addWidget(self.crop_status_label)
-        layout.addWidget(self.raw_dimensions_label)
+        layout.addWidget(self.dimensions_label)
         layout.addWidget(self.removed_pixels_label)
         layout.addWidget(self.removed_percentage_label)
         layout.addWidget(self.export_mode_label)
-        layout.addWidget(self.zoom_label)
-        layout.addWidget(self.export_directory_label)
-        layout.addWidget(self.project_info_label)
-        layout.addWidget(self.warning_label)
+        layout.addWidget(self.zoom_status_label)
         return widget
 
-    def _sync_preview_zoom_spin(self, value: int) -> None:
-        if self.preview_zoom_spin.value() != value:
-            self.preview_zoom_spin.blockSignals(True)
-            self.preview_zoom_spin.setValue(value)
-            self.preview_zoom_spin.blockSignals(False)
-        self.zoom_label.setText(f"Current zoom: {value}%")
+    def _source_sheet_map(self) -> dict[str, SourceSheet]:
+        return {sheet.source_sheet_id: sheet for sheet in self.project_manager.project.source_sheets}
 
-    def _on_preview_mode_changed(self, *_args) -> None:
-        self._preview_mode = {0: "before", 1: "after", 2: "split"}[self.preview_mode_combo.currentIndex()]
-        self.preview_view.set_preview_mode(self._preview_mode)
-        self._push_history()
-        self._refresh_all()
+    def _current_asset(self) -> AssetRecord | None:
+        return self.project_manager.active_asset
 
-    def _on_preview_style_changed(self, *_args) -> None:
-        self._background_style = self.background_style_combo.currentText()
-        self._checkerboard_size = self.checker_size_combo.currentText()
-        self.preview_view.set_background_style(self._background_style, self._checkerboard_size)
-        self._push_history()
+    def _on_notes_changed(self, *_args) -> None:
+        if self._editing_programmatically:
+            return
+        asset = self._current_asset()
+        if asset is None:
+            self.project_manager.project.project.notes = self.project_notes_edit.toPlainText()
+            self.project_manager.project.mark_modified()
+            return
+        self.project_manager.edit_asset(asset.asset_uuid, notes=self.project_notes_edit.toPlainText())
+        self._schedule_preview_refresh()
+
+    def _on_filename_edited(self, *_args) -> None:
+        if self._editing_programmatically:
+            return
+        asset = self._current_asset()
+        if asset is None:
+            return
+        self.project_manager.edit_asset(
+            asset.asset_uuid,
+            raw_output_filename=self.raw_filename_edit.text().strip(),
+            clean_output_filename=self.clean_filename_edit.text().strip(),
+        )
+        self._refresh_asset_list()
+
+    def _on_output_folder_changed(self, *_args) -> None:
+        if self._editing_programmatically:
+            return
+        asset = self._current_asset()
+        if asset is None:
+            self.project_manager.project.defaults.output_folder = self.output_folder_edit.text().strip()
+            self.project_manager.project.mark_modified()
+            return
+        self.project_manager.edit_asset(asset.asset_uuid, output_folder=self.output_folder_edit.text().strip())
 
     def _on_tolerance_changed(self, *_args) -> None:
+        if self._editing_programmatically:
+            return
         value = self.tolerance_slider.value() if self.sender() is self.tolerance_slider else self.tolerance_spin.value()
-        value = clamp_int(value, 0, 100)
-        if self.tolerance_slider.value() != value:
-            self.tolerance_slider.blockSignals(True)
-            self.tolerance_slider.setValue(value)
-            self.tolerance_slider.blockSignals(False)
-        if self.tolerance_spin.value() != value:
-            self.tolerance_spin.blockSignals(True)
-            self.tolerance_spin.setValue(value)
-            self.tolerance_spin.blockSignals(False)
-        self._tolerance_ui = value
-        self._push_history()
-        self._refresh_processing()
+        self.tolerance_slider.blockSignals(True)
+        self.tolerance_spin.blockSignals(True)
+        self.tolerance_slider.setValue(value)
+        self.tolerance_spin.setValue(value)
+        self.tolerance_slider.blockSignals(False)
+        self.tolerance_spin.blockSignals(False)
+        asset = self._current_asset()
+        if asset is not None:
+            self.project_manager.apply_background_settings_to_active_asset(
+                self._background_rgba(),
+                value,
+                self.connected_only_checkbox.isChecked(),
+                8 if self.connectivity_checkbox.isChecked() else 4,
+            )
+            if asset.workflow_status == WorkflowStatus.reviewed:
+                self._handle_reviewed_edit(asset)
+        self._schedule_preview_refresh()
 
-    def _on_connected_mode_changed(self, *_args) -> None:
-        self._connected_background_only = self.connected_only_checkbox.isChecked()
-        self._push_history()
-        self._refresh_processing()
+    def _on_delete_shortcut(self) -> None:
+        if isinstance(self.focusWidget(), (QLineEdit, QTextEdit)):
+            return
+        self.delete_asset()
 
-    def _on_connectivity_changed(self, *_args) -> None:
-        self._connectivity = 8 if self.connectivity_checkbox.isChecked() else 4
-        self._push_history()
-        self._refresh_processing()
+    def _on_preview_mode_changed(self, *_args) -> None:
+        self.preview_view.set_preview_mode({0: "before", 1: "after", 2: "split"}[self.preview_mode_combo.currentIndex()])
+        self._schedule_preview_refresh()
 
-    def _on_export_name_changed(self, *_args) -> None:
-        self._output_raw_filename = self.raw_filename_edit.text().strip()
-        self._output_clean_filename = self.clean_filename_edit.text().strip()
-        self._push_history()
+    def _sync_preview_zoom(self, value: int) -> None:
+        self.preview_zoom_spin.blockSignals(True)
+        self.preview_zoom_spin.setValue(value)
+        self.preview_zoom_spin.blockSignals(False)
+        self.zoom_status_label.setText(f"Current zoom: {value}%")
 
-    def start_eyedropper(self) -> None:
-        if self._raw_crop is None:
-            self._show_warning("No crop exists yet.")
+    def _schedule_preview_refresh(self, *_args) -> None:
+        self._debounce_timer.start(120)
+
+    def _refresh_preview(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            self.preview_view.set_images(None, None)
+            self._update_status_labels()
+            return
+        raw_image = self._raw_crop_for_asset(asset)
+        if raw_image is None:
+            self.preview_view.set_images(None, None)
+            self._update_status_labels()
+            return
+        clean_result = self._apply_cleaning(raw_image, asset.background_removal)
+        self.preview_view.set_images(raw_image, clean_result.cleaned_image)
+        self.preview_view.set_preview_mode({0: "before", 1: "after", 2: "split"}[self.preview_mode_combo.currentIndex()])
+        self.preview_view.set_background_style(self.background_style_combo.currentText(), self.checkerboard_combo.currentText())
+        self._update_status_labels(clean_result)
+
+    def _update_status_labels(self, result: BackgroundRemovalResult | None = None) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            self.crop_status_label.setText("Crop rectangle: none")
+            self.dimensions_label.setText("Raw crop dimensions: none")
+            self.removed_pixels_label.setText("Removed pixels: 0")
+            self.removed_percentage_label.setText("Removed: 0.0%")
+            self.zoom_status_label.setText(f"Current zoom: {self.preview_view.zoom_percent()}%")
+            self.export_mode_label.setText("Export mode: raw + clean")
+            self.warning_label.setText("")
+            self._refresh_progress()
+            return
+        crop = asset.crop_rect
+        if crop is None:
+            self.crop_status_label.setText("Crop rectangle: none")
+            self.dimensions_label.setText("Raw crop dimensions: none")
+        else:
+            self.crop_status_label.setText(f"Crop rectangle: {crop.x}, {crop.y}, {crop.width}, {crop.height}")
+            self.dimensions_label.setText(f"Raw crop dimensions: {crop.width} x {crop.height}")
+        self.raw_filename_edit.setText(asset.raw_output_filename)
+        self.clean_filename_edit.setText(asset.clean_output_filename)
+        self.output_folder_edit.setText(asset.output_folder or self.project_manager.project.defaults.output_folder)
+        self.removed_pixels_label.setText(f"Removed pixels: {result.removed_pixels if result else 0}")
+        self.removed_percentage_label.setText(f"Removed: {result.removal_percentage:.1f}%" if result else "Removed: 0.0%")
+        self.export_mode_label.setText(f"Export mode: {asset.workflow_status.value}")
+        self.zoom_status_label.setText(f"Current zoom: {self.preview_view.zoom_percent()}%")
+        warnings = removal_warning_messages(
+            crop_exists=asset.crop_rect is not None,
+            background_rgba=asset.background_removal.background_rgba,
+            connected_background_only=asset.background_removal.connected_background_only,
+            removal_result=result,
+        )
+        if result is not None and result.removal_percentage > 80:
+            warnings.append("Removal erases more than 80% of crop pixels.")
+        self.warning_label.setText(" ".join(warnings))
+        self._refresh_progress()
+
+    def _refresh_progress(self) -> None:
+        counts = self.project_manager.project_progress_counts()
+        total = counts["total"]
+        exported = counts["exported_count"]
+        self.progress_label.setText(f"Project Progress: {exported} / {total} exported")
+        self.progress_bar.setValue(0 if total == 0 else round(exported / total * 100))
+        asset = self._current_asset()
+        if asset is None or not asset.character_group:
+            self.group_progress_label.setText("Group Progress: 0 / 0 exported")
+        else:
+            group_counts = self.project_manager.group_progress_counts(asset.character_group)
+            self.group_progress_label.setText(
+                f"Group Progress: {group_counts['exported_count']} / {group_counts['total']} exported"
+            )
+
+    def _update_ui_from_project(self) -> None:
+        self.project_name_label.setText(self.project_manager.project.project.project_name)
+        self.project_notes_edit.blockSignals(True)
+        self.project_notes_edit.setPlainText(self.project_manager.project.project.notes)
+        self.project_notes_edit.blockSignals(False)
+        self._source_sheet_lookup = self._source_sheet_map()
+        self._refresh_source_sheet_combo()
+        self._refresh_asset_list()
+        self._sync_active_asset_to_ui()
+        self._refresh_progress()
+        self._autosave_timer.setInterval(clamp_int(self.project_manager.project.project.autosave_interval_seconds, 30, 600) * 1000)
+
+    def _refresh_source_sheet_combo(self) -> None:
+        self.source_sheet_combo.blockSignals(True)
+        self.source_sheet_combo.clear()
+        for sheet in self.project_manager.project.source_sheets:
+            self.source_sheet_combo.addItem(sheet.label, sheet.source_sheet_id)
+        self.source_sheet_combo.blockSignals(False)
+        if self.project_manager.project.source_sheets:
+            self.source_sheet_combo.setCurrentIndex(0)
+            self._on_source_sheet_selected()
+
+    def _refresh_asset_list(self, *_args) -> None:
+        search = self.search_edit.text().strip().lower()
+        group = self.group_filter.currentText()
+        category = self.category_filter.currentText()
+        direction = self.direction_filter.currentText()
+        status = self.status_filter.currentText()
+
+        self.asset_list.blockSignals(True)
+        self.asset_list.clear()
+        self.group_filter.blockSignals(True)
+        self.category_filter.blockSignals(True)
+        self.direction_filter.blockSignals(True)
+        self.status_filter.blockSignals(True)
+        self._populate_filters()
+        self.group_filter.setCurrentText(group if group in [self.group_filter.itemText(i) for i in range(self.group_filter.count())] else "All groups")
+        self.category_filter.setCurrentText(category if category in [self.category_filter.itemText(i) for i in range(self.category_filter.count())] else "All categories")
+        self.direction_filter.setCurrentText(direction if direction in [self.direction_filter.itemText(i) for i in range(self.direction_filter.count())] else "All directions")
+        self.status_filter.setCurrentText(status if status in [self.status_filter.itemText(i) for i in range(self.status_filter.count())] else "All statuses")
+        self.group_filter.blockSignals(False)
+        self.category_filter.blockSignals(False)
+        self.direction_filter.blockSignals(False)
+        self.status_filter.blockSignals(False)
+
+        for asset in self.project_manager.project.assets:
+            if search and search not in asset.display_name.lower() and search not in asset.notes.lower():
+                continue
+            if group != "All groups" and asset.character_group != group:
+                continue
+            if category != "All categories" and asset.category != category:
+                continue
+            if direction != "All directions" and asset.direction != direction:
+                continue
+            if status != "All statuses" and asset.workflow_status.value != status:
+                continue
+            item = QListWidgetItem(self._asset_label(asset))
+            item.setData(Qt.ItemDataRole.UserRole, asset.asset_uuid)
+            self.asset_list.addItem(item)
+        self.asset_list.blockSignals(False)
+        self._highlight_active_asset()
+
+    def _sync_active_asset_to_ui(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            self._editing_programmatically = True
+            self.raw_filename_edit.clear()
+            self.clean_filename_edit.clear()
+            self.output_folder_edit.clear()
+            self._editing_programmatically = False
+            return
+        self._restore_asset_controls(asset)
+        self._refresh_preview()
+
+    def _populate_filters(self) -> None:
+        def fill(combo: QComboBox, values: list[str], current: str) -> None:
+            combo.clear()
+            combo.addItem(current)
+            for value in sorted({value for value in values if value}):
+                combo.addItem(value)
+
+        fill(self.group_filter, [asset.character_group for asset in self.project_manager.project.assets], "All groups")
+        fill(self.category_filter, [asset.category for asset in self.project_manager.project.assets], "All categories")
+        fill(self.direction_filter, [asset.direction for asset in self.project_manager.project.assets], "All directions")
+        fill(self.status_filter, [asset.workflow_status.value for asset in self.project_manager.project.assets], "All statuses")
+
+    def _asset_label(self, asset: AssetRecord) -> str:
+        marker = {
+            WorkflowStatus.planned: "○",
+            WorkflowStatus.cropped: "◌",
+            WorkflowStatus.cleaned: "◍",
+            WorkflowStatus.reviewed: "✓",
+            WorkflowStatus.exported: "✔",
+            WorkflowStatus.needs_revision: "⚠",
+        }[asset.workflow_status]
+        parts = [asset.display_name]
+        if asset.character_group:
+            parts.insert(0, asset.character_group)
+        if asset.category:
+            parts.insert(1 if asset.character_group else 0, asset.category)
+        if asset.direction:
+            parts.append(asset.direction)
+        if asset.frame_number is not None:
+            parts.append(f"{asset.frame_number:02d}")
+        return f"[{marker}] " + " / ".join(parts)
+
+    def _highlight_active_asset(self) -> None:
+        active = self._active_asset_id
+        for index in range(self.asset_list.count()):
+            item = self.asset_list.item(index)
+            item.setSelected(item.data(Qt.ItemDataRole.UserRole) == active)
+
+    def _on_asset_selection_changed(self) -> None:
+        selected = self.asset_list.selectedItems()
+        if not selected:
+            return
+        asset_uuid = selected[0].data(Qt.ItemDataRole.UserRole)
+        self._set_active_asset(asset_uuid)
+
+    def _set_active_asset(self, asset_uuid: str) -> None:
+        asset = self.project_manager.get_asset(asset_uuid)
+        self.project_manager.active_asset_uuid = asset_uuid
+        self._active_asset_id = asset_uuid
+        sheet = self._sheet_for_asset(asset)
+        if sheet is not None:
+            self._load_source_sheet(sheet)
+        self._restore_asset_controls(asset)
+        self._refresh_preview()
+        self._highlight_active_asset()
+
+    def _restore_asset_controls(self, asset: AssetRecord) -> None:
+        self._editing_programmatically = True
+        self.tolerance_slider.setValue(asset.background_removal.tolerance_ui)
+        self.tolerance_spin.setValue(asset.background_removal.tolerance_ui)
+        self.connected_only_checkbox.setChecked(asset.background_removal.connected_background_only)
+        self.connectivity_checkbox.setChecked(asset.background_removal.connectivity == 8)
+        self.raw_filename_edit.setText(asset.raw_output_filename)
+        self.clean_filename_edit.setText(asset.clean_output_filename)
+        self.output_folder_edit.setText(asset.output_folder or self.project_manager.project.defaults.output_folder)
+        self.project_notes_edit.setPlainText(self.project_manager.project.project.notes)
+        self.preview_view.set_preview_mode("before" if self.preview_mode_combo.currentIndex() == 0 else "after" if self.preview_mode_combo.currentIndex() == 1 else "split")
+        self._editing_programmatically = False
+
+    def _sheet_for_asset(self, asset: AssetRecord) -> SourceSheet | None:
+        if asset.source_sheet_id and asset.source_sheet_id in self._source_sheet_lookup:
+            return self._source_sheet_lookup[asset.source_sheet_id]
+        if asset.source_sheet_path:
+            for sheet in self.project_manager.project.source_sheets:
+                if Path(sheet.path) == Path(asset.source_sheet_path):
+                    return sheet
+        return None
+
+    def _load_source_sheet(self, sheet: SourceSheet) -> None:
+        path = Path(sheet.path)
+        if not path.exists():
+            sheet.missing = True
+            self.source_image_info_label.setText(f"Missing source sheet: {sheet.label}\n{sheet.path}")
+            return
+        if sheet.source_sheet_id not in self._loaded_images:
+            try:
+                self._loaded_images[sheet.source_sheet_id] = load_png(path)
+            except ImageLoadError as exc:
+                self._show_error("Could not open source sheet", str(exc))
+                return
+        image = self._loaded_images[sheet.source_sheet_id]
+        pixmap = pil_image_to_qpixmap(image)
+        self.canvas.set_image(pixmap)
+        self.source_image_info_label.setText(
+            f"{sheet.label}\n{sheet.path}\n{sheet.width or image.width} x {sheet.height or image.height}"
+        )
+
+    def _on_source_sheet_selected(self, *_args) -> None:
+        if self.source_sheet_combo.currentIndex() < 0:
+            return
+        sheet_id = self.source_sheet_combo.currentData()
+        if not sheet_id:
+            return
+        self._active_sheet_id = str(sheet_id)
+        sheet = self._source_sheet_lookup.get(self._active_sheet_id)
+        if sheet is not None:
+            self._load_source_sheet(sheet)
+            self.source_sheet_label.setText(sheet.label)
+        self._refresh_preview()
+
+    def _raw_crop_for_asset(self, asset: AssetRecord) -> Image.Image | None:
+        sheet = self._sheet_for_asset(asset)
+        if sheet is None or not sheet.path:
+            return None
+        path = Path(sheet.path)
+        if not path.exists():
+            return None
+        image = self._loaded_images.get(sheet.source_sheet_id)
+        if image is None:
+            image = load_png(path)
+            self._loaded_images[sheet.source_sheet_id] = image
+        if asset.crop_rect is None:
+            return None
+        return crop_image(image, asset.crop_rect)
+
+    def _apply_cleaning(self, raw_image: Image.Image, settings: BackgroundRemovalSettingsModel) -> BackgroundRemovalResult:
+        config = BackgroundRemovalSettings(
+            background_rgba=settings.background_rgba,
+            tolerance_ui=settings.tolerance_ui,
+            connected_background_only=settings.connected_background_only,
+            connectivity=settings.connectivity,
+        )
+        return apply_background_removal(raw_image, config)
+
+    def _background_rgba(self) -> tuple[int, int, int, int] | None:
+        asset = self._current_asset()
+        if asset is None:
+            return None
+        return asset.background_removal.background_rgba
+
+    def _on_canvas_crop_changed(self, rect: QRectF) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        crop = self._rect_to_crop(rect)
+        if crop is None:
+            return
+        if asset.workflow_status == WorkflowStatus.reviewed:
+            self._handle_reviewed_edit(asset)
+        self.project_manager.apply_crop_to_active_asset(crop)
+        self._schedule_preview_refresh()
+        self._refresh_asset_list()
+
+    def _rect_to_crop(self, rect: QRectF):
+        left = int(round(rect.left()))
+        top = int(round(rect.top()))
+        width = int(round(rect.width()))
+        height = int(round(rect.height()))
+        from ..models import CropRect
+
+        return CropRect(left, top, width, height)
+
+    def _on_color_picked(self, picked: PickedColor) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        self._eyedropper_active = False
+        self.preview_view.set_eyedropper_active(False)
+        if asset.workflow_status == WorkflowStatus.reviewed:
+            self._handle_reviewed_edit(asset)
+        self.project_manager.apply_background_settings_to_active_asset(
+            picked.rgba,
+            asset.background_removal.tolerance_ui,
+            asset.background_removal.connected_background_only,
+            asset.background_removal.connectivity,
+        )
+        self._schedule_preview_refresh()
+
+    def _start_eyedropper(self) -> None:
+        if self._current_asset() is None:
+            self._show_warning("No active asset selected.")
             return
         self._eyedropper_active = True
         self.preview_view.set_eyedropper_active(True)
-        self.statusBar().showMessage("Eyedropper active. Click the preview to pick a background color, or press Escape to cancel.")
 
-    def cancel_eyedropper(self) -> None:
-        if not self._eyedropper_active:
+    def _reset_background_removal(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
             return
-        self._eyedropper_active = False
-        self.preview_view.set_eyedropper_active(False)
-        self.statusBar().showMessage("Eyedropper cancelled", 3000)
-
-    def _on_preview_color_picked(self, picked: PickedColor) -> None:
-        self._eyedropper_active = False
-        self.preview_view.set_eyedropper_active(False)
-        self._set_background_color(picked.rgba)
-
-    def _set_background_color(self, rgba: tuple[int, int, int, int]) -> None:
-        self._background_rgba = rgba
-        self._push_history()
-        self._refresh_processing()
-
-    def reset_background_removal(self) -> None:
-        self._background_rgba = None
-        self._tolerance_ui = 5
-        self._connected_background_only = True
-        self._connectivity = 4
-        self._eyedropper_active = False
-        self._restore_controls_from_state()
-        self._push_history()
-        self._refresh_processing()
-
-    def open_png(self) -> None:
-        file_name, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open PNG reference sheet",
-            "",
-            "PNG Images (*.png);;All Files (*)",
+        self.project_manager.edit_asset(
+            asset.asset_uuid,
+            background_rgba=None,
+            tolerance_ui=5,
+            connected_background_only=True,
+            connectivity=4,
         )
+        self._restore_asset_controls(asset)
+        self._schedule_preview_refresh()
+
+    def _regenerate_filename(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        generated = generate_filename(
+            asset.character_group or asset.display_name,
+            asset.category,
+            asset.action,
+            asset.direction,
+            asset.frame_number,
+            asset.variant,
+        )
+        self.raw_filename_edit.setText(generated)
+        self.clean_filename_edit.setText(generated.replace(".png", "_clean.png"))
+
+    def _handle_reviewed_edit(self, asset: AssetRecord) -> None:
+        response = QMessageBox.question(
+            self,
+            "Reviewed asset edited",
+            f"{asset.display_name} is marked reviewed. Change it back to needs revision?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if response == QMessageBox.StandardButton.Yes:
+            self.project_manager.mark_status(asset.asset_uuid, WorkflowStatus.needs_revision)
+
+    def _mark_status(self, status: WorkflowStatus) -> None:
+        asset = self._current_asset()
+        if asset is None:
+            return
+        self.project_manager.mark_status(asset.asset_uuid, status)
+        self._refresh_asset_list()
+        self._schedule_preview_refresh()
+
+    def add_source_sheet(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Add Source Sheet", "", "PNG Images (*.png)")
         if not file_name:
             return
-        self.load_image(Path(file_name))
+        sheet = self.project_manager.add_source_sheet(file_name)
+        if sheet.source_sheet_id not in self._loaded_images:
+            try:
+                self._loaded_images[sheet.source_sheet_id] = load_png(file_name)
+            except ImageLoadError:
+                pass
+        self._update_ui_from_project()
+        self.statusBar().showMessage(f"Added source sheet {sheet.label}", 4000)
 
-    def load_image(self, file_path: Path, reset_project: bool = True) -> None:
-        try:
-            image = load_png(file_path)
-        except ImageLoadError as exc:
-            self._show_error("Could not open image", str(exc))
+    def remove_source_sheet(self) -> None:
+        sheet = self._current_source_sheet()
+        if sheet is None:
             return
-
-        self._source_path = file_path
-        self._source_image = image
-        self.project_info_label.setText(
-            f"Loaded source image: {file_path}\n"
-            f"Image size: {image.width} x {image.height}"
-        )
-        analysis = analyze_image(image)
-        self.statusBar().showMessage(
-            f"Loaded {file_path.name} | size {analysis.width} x {analysis.height} | edge pixels {analysis.edge_pixel_count}"
-        )
-        if reset_project:
-            self._background_rgba = None
-            self._tolerance_ui = 5
-            self._connected_background_only = True
-            self._connectivity = 4
-            self._preview_mode = "after"
-            self._background_style = "checkerboard"
-            self._checkerboard_size = "medium"
-            self._set_default_output_names()
-            self._crop_rect = None
-            self._raw_crop = None
-            self._clean_crop = None
-            self._removal_result = None
-        self.canvas.set_image(self._source_to_pixmap(image))
-        self.canvas.set_crop_rect(None)
-        self.preview_view.set_images(None, None)
-        self.preview_view.set_preview_mode(self._preview_mode)
-        if reset_project:
-            self._push_history(reset=True)
-        self._refresh_all()
-
-    def _source_to_pixmap(self, image: Image.Image):
-        from ..image_tools import pil_image_to_qpixmap
-
-        return pil_image_to_qpixmap(image)
-
-    def _on_crop_changed(self, rect: QRectF) -> None:
-        crop = CropRect(int(round(rect.x())), int(round(rect.y())), int(round(rect.width())), int(round(rect.height())))
-        if not crop.is_valid() or self._source_image is None:
+        used = [asset.display_name for asset in self.project_manager.project.assets if asset.source_sheet_id == sheet.source_sheet_id]
+        text = f"Remove reference to {sheet.label}?"
+        if used:
+            text += f"\nAssets using it: {', '.join(used[:5])}"
+        if QMessageBox.question(self, "Remove Source Sheet", text) != QMessageBox.StandardButton.Yes:
             return
-        try:
-            self._raw_crop = crop_image(self._source_image, crop)
-        except CropError as exc:
-            self._show_error("Invalid crop", str(exc))
+        self.project_manager.remove_source_sheet(sheet.source_sheet_id)
+        self._update_ui_from_project()
+
+    def rename_source_sheet_label(self) -> None:
+        sheet = self._current_source_sheet()
+        if sheet is None:
             return
-        self._crop_rect = crop
-        self._push_history(reset=True)
-        self._refresh_processing()
+        from PySide6.QtWidgets import QInputDialog
 
-    def _refresh_processing(self) -> None:
-        if self._raw_crop is None:
-            self.preview_view.set_images(None, None)
-            self._removal_result = None
-            self._update_status()
+        label, ok = QInputDialog.getText(self, "Rename Source Sheet", "Display label:", text=sheet.label)
+        if ok and label.strip():
+            sheet.label = label.strip()
+            self.project_manager.project.mark_modified()
+            self._update_ui_from_project()
+
+    def relink_source_sheet(self) -> None:
+        sheet = self._current_source_sheet()
+        if sheet is None:
             return
-
-        settings = BackgroundRemovalSettings(
-            background_rgba=self._background_rgba,
-            tolerance_ui=self._tolerance_ui,
-            connected_background_only=self._connected_background_only,
-            connectivity=self._connectivity,
-        )
-        result = apply_background_removal(self._raw_crop, settings)
-        self._removal_result = result
-        self._clean_crop = result.cleaned_image
-        self.preview_view.set_images(self._raw_crop, self._clean_crop)
-        self.preview_view.set_preview_mode(self._preview_mode)
-        self.preview_view.set_background_style(self._background_style, self._checkerboard_size)
-        self._update_status()
-
-    def _update_status(self) -> None:
-        if self._crop_rect is None or self._raw_crop is None:
-            self.crop_status_label.setText("Crop rectangle: none")
-            self.raw_dimensions_label.setText("Raw crop dimensions: none")
-        else:
-            self.crop_status_label.setText(
-                f"Crop rectangle: {self._crop_rect.x}, {self._crop_rect.y}, {self._crop_rect.width}, {self._crop_rect.height}"
-            )
-            self.raw_dimensions_label.setText(
-                f"Raw crop dimensions: {self._raw_crop.width} x {self._raw_crop.height}"
-            )
-
-        self.rgb_label.setText(format_rgb(self._background_rgba))
-        self.rgba_label.setText(format_rgba(self._background_rgba))
-        self.hex_label.setText(format_hex(self._background_rgba))
-        self.background_swatch.setStyleSheet(self._swatch_style())
-        self.color_pick_status.setText(
-            "Background color selected." if self._background_rgba is not None else "No background color selected."
-        )
-
-        threshold = ui_tolerance_to_distance(self._tolerance_ui)
-        self.tolerance_threshold_label.setText(f"Threshold: {threshold:.2f}")
-        self.removed_pixels_label.setText(
-            f"Removed pixels: {self._removal_result.removed_pixels if self._removal_result else 0}"
-        )
-        self.removed_percentage_label.setText(
-            f"Removed: {self._removal_result.removal_percentage:.1f}%" if self._removal_result else "Removed: 0.0%"
-        )
-        self.export_mode_label.setText("Export mode: raw + clean")
-        self.zoom_label.setText(f"Current zoom: {self.preview_view.zoom_percent()}%")
-        self.export_directory_label.setText(
-            f"Last export directory: {self._last_export_directory or 'not set'}"
-        )
-
-        warnings = removal_warning_messages(
-            crop_exists=self._crop_rect is not None and self._raw_crop is not None,
-            background_rgba=self._background_rgba,
-            connected_background_only=self._connected_background_only,
-            removal_result=self._removal_result,
-        )
-        if self._raw_crop is not None and (self._raw_crop.width == 0 or self._raw_crop.height == 0):
-            warnings.append("The crop is empty.")
-
-        self.warning_label.setText(" ".join(warnings))
-        if warnings:
-            self.statusBar().showMessage(warnings[0], 5000)
-        elif self._crop_rect is not None:
-            self.statusBar().showMessage("Crop ready", 3000)
-
-    def _swatch_style(self) -> str:
-        if self._background_rgba is None:
-            return "background: transparent; border: 1px solid #666;"
-        r, g, b, a = self._background_rgba
-        return f"background: rgba({r}, {g}, {b}, {a}); border: 1px solid #666;"
-
-    def _set_default_output_names(self) -> None:
-        if self._source_path is None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Relink Source Sheet", "", "PNG Images (*.png)")
+        if not file_name:
             return
-        stem = self._source_path.stem
-        self._output_raw_filename = f"{stem}_raw.png"
-        self._output_clean_filename = f"{stem}_clean.png"
-        self._restore_controls_from_state()
+        self.project_manager.relink_source_sheet(sheet.source_sheet_id, file_name)
+        self._loaded_images.pop(sheet.source_sheet_id, None)
+        self._update_ui_from_project()
 
-    def _restore_controls_from_state(self) -> None:
-        self.tolerance_slider.blockSignals(True)
-        self.tolerance_spin.blockSignals(True)
-        self.connected_only_checkbox.blockSignals(True)
-        self.connectivity_checkbox.blockSignals(True)
-        self.preview_mode_combo.blockSignals(True)
-        self.background_style_combo.blockSignals(True)
-        self.checker_size_combo.blockSignals(True)
-        self.raw_filename_edit.blockSignals(True)
-        self.clean_filename_edit.blockSignals(True)
+    def _current_source_sheet(self) -> SourceSheet | None:
+        sheet_id = self.source_sheet_combo.currentData()
+        if not sheet_id:
+            return None
+        return self._source_sheet_lookup.get(str(sheet_id))
 
-        self.tolerance_slider.setValue(self._tolerance_ui)
-        self.tolerance_spin.setValue(self._tolerance_ui)
-        self.connected_only_checkbox.setChecked(self._connected_background_only)
-        self.connectivity_checkbox.setChecked(self._connectivity == 8)
-        self.preview_mode_combo.setCurrentIndex({"before": 0, "after": 1, "split": 2}[self._preview_mode])
-        self.background_style_combo.setCurrentText(self._background_style)
-        self.checker_size_combo.setCurrentText(self._checkerboard_size)
-        self.raw_filename_edit.setText(self._output_raw_filename)
-        self.clean_filename_edit.setText(self._output_clean_filename)
-
-        self.tolerance_slider.blockSignals(False)
-        self.tolerance_spin.blockSignals(False)
-        self.connected_only_checkbox.blockSignals(False)
-        self.connectivity_checkbox.blockSignals(False)
-        self.preview_mode_combo.blockSignals(False)
-        self.background_style_combo.blockSignals(False)
-        self.checker_size_combo.blockSignals(False)
-        self.raw_filename_edit.blockSignals(False)
-        self.clean_filename_edit.blockSignals(False)
-
-        self.preview_view.set_preview_mode(self._preview_mode)
-        self.preview_view.set_background_style(self._background_style, self._checkerboard_size)
-        self.preview_view.set_eyedropper_active(self._eyedropper_active)
-
-    def _update_ui_from_state(self) -> None:
-        self._restore_controls_from_state()
-        self._update_status()
-
-    def _current_snapshot(self) -> EditorSnapshot:
-        return EditorSnapshot(
-            background_rgba=self._background_rgba,
-            tolerance_ui=self._tolerance_ui,
-            connected_background_only=self._connected_background_only,
-            connectivity=self._connectivity,
-            preview_mode=self._preview_mode,
-            background_style=self._background_style,
-            checkerboard_size=self._checkerboard_size,
-            output_raw_filename=self._output_raw_filename,
-            output_clean_filename=self._output_clean_filename,
-            last_export_directory=self._last_export_directory,
+    def add_asset(self) -> None:
+        dialog = AssetDialog(self, [(sheet.source_sheet_id, sheet.label) for sheet in self.project_manager.project.source_sheets])
+        current_sheet = self._current_source_sheet()
+        if current_sheet is not None:
+            index = dialog.source_sheet_combo.findData(current_sheet.source_sheet_id)
+            if index >= 0:
+                dialog.source_sheet_combo.setCurrentIndex(index)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        payload = dialog.payload()
+        if not payload["display_name"]:
+            payload["display_name"] = payload["character_group"] or "asset"
+        asset = self.project_manager.add_asset(
+            display_name=str(payload["display_name"]),
+            source_sheet_id=str(payload["source_sheet_id"]),
+            source_sheet_path=str(self._source_sheet_lookup.get(str(payload["source_sheet_id"]), SourceSheet("", "", "")).path if payload["source_sheet_id"] else ""),
+            character_group=str(payload["character_group"]),
+            category=str(payload["category"]),
+            action=str(payload["action"]),
+            direction=str(payload["direction"]),
+            frame_number=payload["frame_number"],
+            variant=str(payload["variant"]),
+            output_folder=str(payload["output_folder"]),
+            notes=str(payload["notes"]),
         )
+        self._active_asset_id = asset.asset_uuid
+        self.project_manager.active_asset_uuid = asset.asset_uuid
+        self._update_ui_from_project()
+        self._set_active_asset(asset.asset_uuid)
 
-    def _push_history(self, reset: bool = False) -> None:
-        snapshot = self._current_snapshot()
-        if reset:
-            self._history = [snapshot]
-            self._history_index = 0
+    def duplicate_asset(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
             return
+        duplicate = self.project_manager.duplicate_asset(asset.asset_uuid, preserve_crop_rect=True)
+        self._update_ui_from_project()
+        self._set_active_asset(duplicate.asset_uuid)
 
-        if self._history and self._history_index >= 0 and self._history[self._history_index] == snapshot:
+    def delete_asset(self) -> None:
+        asset = self._current_asset()
+        if asset is None:
             return
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QCheckBox, QVBoxLayout
 
-        if self._history_index < len(self._history) - 1:
-            self._history = self._history[: self._history_index + 1]
-
-        self._history.append(snapshot)
-        if len(self._history) > 50:
-            self._history.pop(0)
-        self._history_index = len(self._history) - 1
-
-    def undo(self) -> None:
-        if self._history_index <= 0:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Delete Asset")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Delete asset '{asset.display_name}'?"))
+        trash_box = QCheckBox("Also move exported files to project trash")
+        layout.addWidget(trash_box)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        self._history_index -= 1
-        self._restore_snapshot(self._history[self._history_index])
+        self.project_manager.delete_asset(asset.asset_uuid, move_exports_to_trash=trash_box.isChecked())
+        self._update_ui_from_project()
 
-    def redo(self) -> None:
-        if self._history_index >= len(self._history) - 1:
+    def move_asset(self, step: int) -> None:
+        asset = self._current_asset()
+        if asset is None:
             return
-        self._history_index += 1
-        self._restore_snapshot(self._history[self._history_index])
+        self.project_manager.move_asset(asset.asset_uuid, step)
+        self._update_ui_from_project()
 
-    def _restore_snapshot(self, snapshot: EditorSnapshot) -> None:
-        self._background_rgba = snapshot.background_rgba
-        self._tolerance_ui = snapshot.tolerance_ui
-        self._connected_background_only = snapshot.connected_background_only
-        self._connectivity = snapshot.connectivity
-        self._preview_mode = snapshot.preview_mode
-        self._background_style = snapshot.background_style
-        self._checkerboard_size = snapshot.checkerboard_size
-        self._output_raw_filename = snapshot.output_raw_filename
-        self._output_clean_filename = snapshot.output_clean_filename
-        self._last_export_directory = snapshot.last_export_directory
-        self._restore_controls_from_state()
-        self._refresh_processing()
+    def create_freya_template(self) -> None:
+        sheet = self._current_source_sheet()
+        if sheet is None:
+            self._show_warning("Choose the Freya source sheet first.")
+            return
+        created, skipped = self.project_manager.create_freya_movement_template(sheet.source_sheet_id, sheet.path)
+        self._update_ui_from_project()
+        summary = f"Created {len(created)} records."
+        if skipped:
+            summary += f" Skipped {len(skipped)} existing records."
+        self.statusBar().showMessage(summary, 5000)
+
+    def show_activity_log(self) -> None:
+        dialog = ActivityLogDialog(self.project_manager.project.activity_log, self)
+        dialog.exec()
 
     def save_project(self) -> None:
-        if self._source_image is None or self._crop_rect is None:
-            self._show_error("Nothing to save", "Open a PNG and select a crop before saving a project.")
+        if self.project_path is None:
+            self.save_project_as()
             return
+        self._save_to_path(self.project_path)
 
-        file_name, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Project",
-            str(Path.cwd() / "config" / "project.json"),
-            "JSON Files (*.json)",
-        )
+    def save_project_as(self) -> None:
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Project As", str(Path.cwd() / "config" / "freya_project.json"), "JSON Files (*.json)")
         if not file_name:
             return
+        self._save_to_path(Path(file_name))
 
-        config = self._build_config()
-        try:
-            save_config(config, file_name)
-            self.statusBar().showMessage(f"Saved project: {file_name}", 4000)
-        except OSError as exc:
-            self._show_error("Could not save project", str(exc))
+    def _save_to_path(self, path: Path) -> None:
+        self.project_manager.project.path = path
+        self.project_manager.project.project.project_root_directory = str(path.parent)
+        save_sprite_project(self.project_manager.project, path)
+        self.project_path = path
+        self.project_manager.project.modified = False
+        from ..project_model import ActivityEntry, utc_now_iso
 
-    def load_project(self) -> None:
-        file_name, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load Project",
-            str(Path.cwd() / "config"),
-            "JSON Files (*.json);;All Files (*)",
+        self.project_manager.project.activity_log.append(
+            ActivityEntry(timestamp=utc_now_iso(), event_type="project_save", message=f"Project saved to {path}")
         )
+        self.project_manager.project.activity_log = self.project_manager.project.activity_log[-1000:]
+        self.statusBar().showMessage(f"Saved project: {path}", 4000)
+
+    def new_project(self) -> None:
+        self.project_manager.new_project("Untitled Project", str(Path.cwd()))
+        self.project_path = None
+        self._loaded_images.clear()
+        self._active_sheet_id = None
+        self._active_asset_id = None
+        self._update_ui_from_project()
+
+    def open_project(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Open Project", str(Path.cwd() / "config"), "JSON Files (*.json)")
         if not file_name:
             return
-
-        try:
-            config = load_config(file_name)
-        except ConfigError as exc:
-            self._show_error("Could not load project", str(exc))
-            return
-
-        self._apply_config(config)
-
-    def _apply_config(self, config: CropConfig) -> None:
-        self._background_rgba = config.background_rgba
-        self._tolerance_ui = clamp_int(config.tolerance_ui, 0, 100)
-        self._connected_background_only = config.connected_background_only
-        self._connectivity = 8 if config.connectivity == 8 else 4
-        self._preview_mode = "after"
-        self._background_style = "checkerboard"
-        self._checkerboard_size = "medium"
-        self._output_raw_filename = config.output_raw_filename
-        self._output_clean_filename = config.output_clean_filename
-        self._last_export_directory = config.export_directory
-        self._restore_controls_from_state()
-
-        source_path = Path(config.source_image) if config.source_image else None
-        if source_path is not None and source_path.exists():
-            self.load_image(source_path, reset_project=False)
-            self._crop_rect = config.crop_rect
-            self.canvas.set_crop_rect(QRectF(config.crop_rect.x, config.crop_rect.y, config.crop_rect.width, config.crop_rect.height))
-            try:
-                self._raw_crop = crop_image(self._source_image, config.crop_rect)
-            except Exception as exc:
-                self._show_error("Could not apply project crop", str(exc))
-                return
-            self._refresh_processing()
-            self.statusBar().showMessage(f"Loaded project: {source_path.name}", 4000)
+        path = Path(file_name)
+        autosave = autosave_path(path)
+        if has_newer_autosave(path):
+            response = QMessageBox.question(
+                self,
+                "Recover autosave?",
+                f"A newer autosave was found:\n{autosave}\nRecover it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if response == QMessageBox.StandardButton.Yes:
+                self.project_manager.project = recover_autosave(path)
+                self.project_manager.project.path = path
+            else:
+                self.project_manager.project = load_sprite_project(
+                    path,
+                    recover_backup=self._recover_backup_prompt,
+                )
         else:
-            self._source_path = None
-            self._source_image = None
-            self._raw_crop = None
-            self._clean_crop = None
-            self._removal_result = None
-            self.canvas.set_image(self._source_to_pixmap(Image.new("RGBA", (1, 1), (0, 0, 0, 0))))
-            self.canvas.set_crop_rect(None)
-            self.preview_view.set_images(None, None)
-            self._update_status()
-            self._show_warning("Project loaded without a source image path.")
+            self.project_manager.project = load_sprite_project(path, recover_backup=self._recover_backup_prompt)
+        self.project_path = path
+        self._loaded_images.clear()
+        self._update_ui_from_project()
+        self.statusBar().showMessage(f"Loaded project: {path}", 4000)
 
-        self._push_history(reset=True)
-
-    def _build_config(self) -> CropConfig:
-        if self._source_path is None or self._crop_rect is None:
-            raise ConfigError("No source image or crop rectangle available.")
-        return CropConfig(
-            source_image=str(self._source_path),
-            crop_rect=self._crop_rect,
-            background_rgba=self._background_rgba,
-            tolerance_ui=self._tolerance_ui,
-            tolerance_threshold=ui_tolerance_to_distance(self._tolerance_ui),
-            connected_background_only=self._connected_background_only,
-            connectivity=self._connectivity,
-            output_raw_filename=self._output_raw_filename,
-            output_clean_filename=self._output_clean_filename,
-            export_directory=self._last_export_directory,
-            config_version=2,
+    def _recover_backup_prompt(self, main_path: Path, backup_path: Path) -> bool:
+        response = QMessageBox.question(
+            self,
+            "Recover backup?",
+            f"The main project file appears malformed:\n{main_path}\nRecover from backup?\n{backup_path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
         )
+        return response == QMessageBox.StandardButton.Yes
+
+    def _maybe_autosave(self) -> None:
+        project = self.project_manager.project
+        if project.path is None or not project.modified or not project.project.autosave_enabled:
+            return
+        try:
+            save_autosave(project)
+        except Exception:
+            pass
 
     def export_raw(self) -> None:
-        if self._raw_crop is None:
-            self._show_error("Nothing to export", "Open a PNG and select a crop first.")
+        asset = self._current_asset()
+        if asset is None:
             return
-        destination = self._prompt_export_path(self._output_raw_filename or "crop_raw.png")
+        raw_image = self._raw_crop_for_asset(asset)
+        if raw_image is None:
+            self._show_error("Nothing to export", "Selected asset has no valid crop.")
+            return
+        destination = self._export_destination(asset.raw_output_filename or "crop_raw.png", asset.output_folder)
         if destination is None:
             return
-        self._export_image(self._raw_crop, destination, "raw")
+        self._save_export(asset, raw_image, destination, "raw")
 
     def export_clean(self) -> None:
-        if self._clean_crop is None:
-            self._show_error("Nothing to export", "Open a PNG, select a crop, and configure background removal first.")
+        asset = self._current_asset()
+        if asset is None:
             return
-        destination = self._prompt_export_path(self._output_clean_filename or "crop_clean.png")
+        raw_image = self._raw_crop_for_asset(asset)
+        if raw_image is None:
+            self._show_error("Nothing to export", "Selected asset has no valid crop.")
+            return
+        clean = self._apply_cleaning(raw_image, asset.background_removal)
+        destination = self._export_destination(asset.clean_output_filename or "crop_clean.png", asset.output_folder)
         if destination is None:
             return
-        self._export_image(self._clean_crop, destination, "clean")
+        self._save_export(asset, clean.cleaned_image, destination, "clean")
 
-    def _prompt_export_path(self, default_name: str) -> Path | None:
-        start_dir = self._last_export_directory or str(Path.cwd() / "output")
-        file_name, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export PNG",
-            str(Path(start_dir) / default_name),
-            "PNG Files (*.png)",
-        )
-        if not file_name:
-            return None
-        return Path(file_name)
+    def _export_destination(self, filename: str, output_folder: str) -> Path | None:
+        start = Path(output_folder or self.project_manager.project.project.defaults.output_folder or Path.cwd() / "output")
+        file_name, _ = QFileDialog.getSaveFileName(self, "Export PNG", str(start / filename), "PNG Files (*.png)")
+        return Path(file_name) if file_name else None
 
-    def _export_image(self, image: Image.Image, destination: Path, kind: str) -> None:
+    def _save_export(self, asset: AssetRecord, image: Image.Image, destination: Path, kind: str) -> None:
         if destination.exists():
             response = QMessageBox.question(
                 self,
@@ -768,27 +1114,49 @@ class MainWindow(QMainWindow):
             )
             if response != QMessageBox.StandardButton.Yes:
                 return
-        try:
-            export_png(image, destination)
-            self._last_export_directory = str(destination.parent)
-            if kind == "raw":
-                self._output_raw_filename = destination.name
-            else:
-                self._output_clean_filename = destination.name
-            self._restore_controls_from_state()
-            self._update_status()
-            self.statusBar().showMessage(f"Exported {destination.name}", 4000)
-        except OSError as exc:
-            self._show_error("Could not export image", str(exc))
+        export_png(image, destination)
+        asset.export_info.exported_path = str(destination)
+        asset.export_info.exported_at = utc_now_iso()
+        asset.workflow_status = WorkflowStatus.exported
+        asset.modified_at = utc_now_iso()
+        self.project_manager.project.activity_log.append(
+            ActivityEntry(timestamp=utc_now_iso(), event_type="export_success", message=f"Exported {asset.display_name} ({kind})", asset_uuid=asset.asset_uuid)
+        )
+        self.project_manager.project.activity_log = self.project_manager.project.activity_log[-1000:]
+        self.project_manager.project.mark_modified()
+        self._update_ui_from_project()
+        self.statusBar().showMessage(f"Exported {destination.name}", 4000)
 
-    def _refresh_all(self) -> None:
-        self._refresh_processing()
-        self._restore_controls_from_state()
-        self._update_status()
+    def open_output_folder(self) -> None:
+        asset = self._current_asset()
+        folder = Path(asset.output_folder if asset and asset.output_folder else self.project_manager.project.project.defaults.output_folder or Path.cwd() / "output")
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(folder)
+        except Exception:
+            self._show_warning(f"Could not open folder: {folder}")
+
+    def undo(self) -> None:
+        pass
+
+    def redo(self) -> None:
+        pass
+
+    def eventFilter(self, obj, event):
+        if obj is self.asset_list and event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Delete:
+            if isinstance(self.focusWidget(), (QLineEdit, QTextEdit)):
+                return False
+            self.delete_asset()
+            return True
+        return super().eventFilter(obj, event)
+
+    def closeEvent(self, event) -> None:
+        if self.project_manager.project.modified and self.project_path is not None:
+            self._maybe_autosave()
+        super().closeEvent(event)
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
     def _show_warning(self, message: str) -> None:
-        self.warning_label.setText(message)
         QMessageBox.warning(self, "Warning", message)

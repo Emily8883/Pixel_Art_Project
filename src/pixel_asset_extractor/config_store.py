@@ -51,6 +51,29 @@ def load_config(path: str | Path) -> CropConfig:
         crop_rect = CropRect.from_dict(crop_data)
         tolerance_ui = int(payload.get("tolerance_ui", 5))
         tolerance_threshold = float(payload.get("tolerance_threshold", ui_tolerance_to_distance(tolerance_ui)))
+        extras = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "config_version",
+                "version",
+                "source_image",
+                "crop_rect",
+                "x",
+                "y",
+                "width",
+                "height",
+                "background_rgba",
+                "tolerance_ui",
+                "tolerance_threshold",
+                "connected_background_only",
+                "connectivity",
+                "output_raw_filename",
+                "output_clean_filename",
+                "export_directory",
+            }
+        }
         return CropConfig(
             source_image=str(payload.get("source_image", "")),
             crop_rect=crop_rect,
@@ -63,6 +86,7 @@ def load_config(path: str | Path) -> CropConfig:
             output_clean_filename=str(payload.get("output_clean_filename", "")),
             export_directory=payload.get("export_directory"),
             config_version=int(payload.get("config_version", payload.get("version", 1))),
+            extras=extras,
         )
     except Exception as exc:  # pragma: no cover - validation branch
         raise ConfigError(f"Invalid configuration structure: {source}") from exc
