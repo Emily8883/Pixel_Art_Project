@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -54,6 +55,7 @@ from ..project_manager import ProjectManager
 from ..project_model import ActivityEntry, AssetRecord, BackgroundRemovalSettingsModel, SourceSheet, WorkflowStatus, utc_now_iso
 from ..project_store import build_project_from_legacy_config, load_project as load_sprite_project, save_project as save_sprite_project
 from .canvas_view import ImageCanvasView
+from .detection_panel import DetectionPanelWidget
 from .dialogs import ActivityLogDialog, AssetDialog
 from .manual_cleanup_widget import ManualCleanupWidget
 from .normalization_panel import CompareAlignmentDialog, NormalizationInspectorWidget, NormalizationReportDialog
@@ -83,8 +85,14 @@ class MainWindow(QMainWindow):
         self.canvas = ImageCanvasView()
         self.preview_view = CropPreviewView()
         self.preview_view.set_zoom_percent(100)
+        self.detection_widget = DetectionPanelWidget()
+        self.detection_widget.set_canvas_view(self.canvas)
         self.manual_cleanup_widget = ManualCleanupWidget()
         self.normalization_widget = NormalizationInspectorWidget()
+        self.detection_widget.changed.connect(self._refresh_detection_overlay)
+        self.detection_widget.analyzeRequested.connect(self._schedule_preview_refresh)
+        self.detection_widget.generateRequested.connect(self._refresh_detection_overlay)
+        self.detection_widget.createAssetRequested.connect(self._create_asset_from_proposal)
         self.normalization_widget.changed.connect(self._schedule_preview_refresh)
         self.normalization_widget.compareRequested.connect(self._open_compare_alignment)
         self.normalization_widget.exportRequested.connect(self.export_normalized)
@@ -219,6 +227,7 @@ class MainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.addWidget(self._section("Crop Preview", self._build_preview_section()), 1)
+        right_layout.addWidget(self._section("Detection", self.detection_widget), 2)
         right_layout.addWidget(self._section("Manual Cleanup", self.manual_cleanup_widget), 2)
         right_layout.addWidget(self._section("Normalization", self.normalization_widget), 3)
         right_layout.addWidget(self._section("Background Removal", self._build_cleanup_section()))
@@ -252,6 +261,7 @@ class MainWindow(QMainWindow):
             ("Export Clean", self.export_clean),
             ("Export Final", self.export_final),
             ("Export Normalized", self.export_normalized),
+            ("Detect Sprite Regions", self.detect_sprite_regions),
             ("Open Output Folder", self.open_output_folder),
             ("Create Freya Movement Template", self.create_freya_template),
             ("Activity Log", self.show_activity_log),
@@ -269,6 +279,10 @@ class MainWindow(QMainWindow):
         compare_action = QAction("Compare Alignment", self)
         compare_action.triggered.connect(self._open_compare_alignment)
         project_menu.addAction(compare_action)
+        tools_menu = self.menuBar().addMenu("Tools")
+        detect_action = QAction("Detect Sprite Regions", self)
+        detect_action.triggered.connect(self.detect_sprite_regions)
+        tools_menu.addAction(detect_action)
 
     def _build_shortcuts(self) -> None:
         shortcuts = [
@@ -508,6 +522,7 @@ class MainWindow(QMainWindow):
             self.preview_view.set_images(None, None)
             self.manual_cleanup_widget.set_document(None)
             self.normalization_widget.set_context(self.project_manager, None, self.project_path)
+            self._sync_detection_context()
             self._update_status_labels()
             return
         raw_image = self._raw_crop_for_asset(asset)
@@ -515,6 +530,7 @@ class MainWindow(QMainWindow):
             self.preview_view.set_images(None, None)
             self.manual_cleanup_widget.set_document(None)
             self.normalization_widget.set_context(self.project_manager, asset, self.project_path)
+            self._sync_detection_context()
             self._update_status_labels()
             return
         clean_result = self._apply_cleaning(raw_image, asset.background_removal)
@@ -523,7 +539,63 @@ class MainWindow(QMainWindow):
         self.preview_view.set_background_style(self.background_style_combo.currentText(), self.checkerboard_combo.currentText())
         self.manual_cleanup_widget.set_document(self._manual_document_for_asset(asset, raw_image, clean_result.cleaned_image))
         self.normalization_widget.set_context(self.project_manager, asset, self.project_path)
+        self._sync_detection_context()
         self._update_status_labels(clean_result)
+
+    def _sync_detection_context(self) -> None:
+        if self._active_sheet_id is None:
+            self.detection_widget.set_context(self.project_manager, None, self.project_path)
+            self.canvas.clear_detection_overlay()
+            return
+        self.detection_widget.set_context(self.project_manager, self._active_sheet_id, self.project_path)
+        self._refresh_detection_overlay()
+
+    def _refresh_detection_overlay(self) -> None:
+        if self._active_sheet_id is None:
+            self.canvas.clear_detection_overlay()
+            return
+        try:
+            sheet = self.project_manager.source_sheet(self._active_sheet_id)
+        except Exception:
+            self.canvas.clear_detection_overlay()
+            return
+        self.canvas.set_detection_overlay(
+            sheet.crop_proposals,
+            sheet.exclusion_zones,
+            show_numbers=self.detection_widget.show_numbers_checkbox.isChecked(),
+            show_confidence=self.detection_widget.show_confidence_checkbox.isChecked(),
+            show_assigned=self.detection_widget.show_assigned_checkbox.isChecked(),
+            hide_rejected=self.detection_widget.hide_rejected_checkbox.isChecked(),
+            show_exclusion_zones=self.detection_widget.show_exclusions_checkbox.isChecked(),
+        )
+
+    def detect_sprite_regions(self) -> None:
+        if self._active_sheet_id is None:
+            self._show_warning("Choose a source sheet first.")
+            return
+        self.detection_widget.generate_proposals()
+
+    def _create_asset_from_proposal(self, proposal_uuid: str) -> None:
+        if self._active_sheet_id is None:
+            return
+        proposal = self.project_manager.proposal_by_uuid(self._active_sheet_id, proposal_uuid)
+        dialog = AssetDialog(self, source_sheets=[(sheet.source_sheet_id, sheet.label) for sheet in self.project_manager.project.source_sheets])
+        dialog.source_sheet_combo.setCurrentIndex(max(0, dialog.source_sheet_combo.findData(self._active_sheet_id)))
+        dialog.display_name_edit.setText(f"detected_region_{len(self.project_manager.project.assets) + 1:02d}")
+        dialog.category_edit.setCurrentText("other")
+        dialog.action_edit.setCurrentText("detected")
+        dialog.direction_edit.setCurrentText("none")
+        dialog.output_folder_edit.setText(self.project_manager.project.defaults.output_folder)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        payload = dialog.payload()
+        asset = self.project_manager.create_asset_from_proposal(
+            self._active_sheet_id,
+            proposal.proposal_uuid,
+            **payload,
+        )
+        self.project_manager.project.log("asset_created_from_proposal", f"Created asset from proposal {proposal.proposal_uuid}", asset.asset_uuid)
+        self._update_ui_from_project()
 
     def _update_status_labels(self, result: BackgroundRemovalResult | None = None) -> None:
         asset = self._current_asset()
@@ -1125,6 +1197,7 @@ class MainWindow(QMainWindow):
         self._manual_documents.clear()
         self._active_sheet_id = None
         self._active_asset_id = None
+        self._sync_detection_context()
         self._update_ui_from_project()
 
     def open_project(self) -> None:
@@ -1154,6 +1227,7 @@ class MainWindow(QMainWindow):
         self.project_path = path
         self._loaded_images.clear()
         self._manual_documents.clear()
+        self._sync_detection_context()
         self._update_ui_from_project()
         self.statusBar().showMessage(f"Loaded project: {path}", 4000)
 

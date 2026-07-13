@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 from uuid import uuid4
 import shutil
+from copy import deepcopy
 
 from PIL import Image
 
@@ -12,6 +13,22 @@ from .config_store import load_config as load_legacy_config
 from .image_tools import crop_image, load_png
 from .manual_editing import ManualEditDocument, compute_settings_checksum
 from .manual_storage import load_sidecar_png, validate_manual_sidecar
+from .detection import (
+    BackgroundSample,
+    CropProposal,
+    DetectionResult,
+    DetectionSettingsModel,
+    ExclusionZone,
+    ProposalStatus,
+    apply_detection_preset,
+    common_color_suggestions,
+    detect_crop_proposals,
+    merge_proposals as merge_crop_proposals,
+    split_proposal_horizontal as split_crop_proposal_horizontal,
+    split_proposal_vertical as split_crop_proposal_vertical,
+    proposal_cache_key,
+)
+from .models import CropRect
 from .normalization import (
     AlignmentDiagnostics,
     NormalizedOutputResult,
@@ -66,6 +83,9 @@ class ProjectManager:
             project=ProjectRecord(project_name="Untitled Project", project_root_directory=str(Path.cwd())),
         )
         self.active_asset_uuid: str | None = self.project.assets[0].asset_uuid if self.project.assets else None
+        self._proposal_undo_stacks: dict[str, list[tuple[list[CropProposal], list[ExclusionZone], list[BackgroundSample], DetectionSettingsModel]]] = {}
+        self._proposal_redo_stacks: dict[str, list[tuple[list[CropProposal], list[ExclusionZone], list[BackgroundSample], DetectionSettingsModel]]] = {}
+        self._detection_cache: dict[str, DetectionResult] = {}
 
     @property
     def active_asset(self) -> AssetRecord | None:
@@ -386,6 +406,245 @@ class ProjectManager:
         if sheet is None:
             return None
         return sheet.checksum
+
+    def source_sheet(self, source_sheet_id: str) -> SourceSheet:
+        for sheet in self.project.source_sheets:
+            if sheet.source_sheet_id == source_sheet_id:
+                return sheet
+        raise KeyError(source_sheet_id)
+
+    def _resolve_sheet_path(self, sheet: SourceSheet) -> Path | None:
+        if not sheet.path:
+            return None
+        sheet_path = Path(sheet.path)
+        if self.project.path is not None and not sheet_path.is_absolute():
+            sheet_path = self.project.path.parent / sheet_path
+        return sheet_path
+
+    def _load_source_sheet_image(self, sheet: SourceSheet) -> Image.Image | None:
+        sheet_path = self._resolve_sheet_path(sheet)
+        if sheet_path is None or not sheet_path.exists():
+            return None
+        return load_png(sheet_path)
+
+    def _proposal_state_snapshot(self, source_sheet_id: str) -> tuple[list[CropProposal], list[ExclusionZone], list[BackgroundSample], DetectionSettingsModel]:
+        sheet = self.source_sheet(source_sheet_id)
+        return (
+            deepcopy(sheet.crop_proposals),
+            deepcopy(sheet.exclusion_zones),
+            deepcopy(sheet.background_samples),
+            DetectionSettingsModel.from_dict(sheet.detection_settings.to_dict()),
+        )
+
+    def _push_proposal_history(self, source_sheet_id: str) -> None:
+        self._proposal_undo_stacks.setdefault(source_sheet_id, []).append(self._proposal_state_snapshot(source_sheet_id))
+        self._proposal_undo_stacks[source_sheet_id] = self._proposal_undo_stacks[source_sheet_id][-100:]
+        self._proposal_redo_stacks.setdefault(source_sheet_id, []).clear()
+
+    def _restore_proposal_state(self, source_sheet_id: str, snapshot: tuple[list[CropProposal], list[ExclusionZone], list[BackgroundSample], DetectionSettingsModel]) -> None:
+        sheet = self.source_sheet(source_sheet_id)
+        proposals, zones, samples, settings = snapshot
+        sheet.crop_proposals = deepcopy(proposals)
+        sheet.exclusion_zones = deepcopy(zones)
+        sheet.background_samples = deepcopy(samples)
+        sheet.detection_settings = DetectionSettingsModel.from_dict(settings.to_dict())
+        self.project.mark_modified()
+
+    def save_detection_preset(self, name: str, settings: DetectionSettingsModel) -> None:
+        self.project.detection_presets[name] = settings.to_dict()
+        self.project.mark_modified()
+
+    def load_detection_preset(self, name: str) -> DetectionSettingsModel:
+        payload = self.project.detection_presets.get(name)
+        if payload is None:
+            return apply_detection_preset(DetectionSettingsModel(), name)
+        return DetectionSettingsModel.from_dict(payload)
+
+    def add_background_sample(self, source_sheet_id: str, rgba: tuple[int, int, int, int], label: str = "", source: str = "manual") -> BackgroundSample:
+        sheet = self.source_sheet(source_sheet_id)
+        self._push_proposal_history(source_sheet_id)
+        sample = BackgroundSample(rgba=rgba, source=source, label=label)
+        sheet.background_samples.append(sample)
+        sheet.detection_settings.background_samples = deepcopy(sheet.background_samples)
+        self.project.mark_modified()
+        return sample
+
+    def clear_background_samples(self, source_sheet_id: str) -> None:
+        sheet = self.source_sheet(source_sheet_id)
+        self._push_proposal_history(source_sheet_id)
+        sheet.background_samples.clear()
+        sheet.detection_settings.background_samples = []
+        self.project.mark_modified()
+
+    def add_exclusion_zone(self, source_sheet_id: str, rect: CropRect, name: str = "Exclusion Zone", zone_type: str = "manual_rectangle") -> ExclusionZone:
+        sheet = self.source_sheet(source_sheet_id)
+        self._push_proposal_history(source_sheet_id)
+        zone = ExclusionZone(source_sheet_uuid=source_sheet_id, rect=rect, name=name, zone_type=zone_type)
+        sheet.exclusion_zones.append(zone)
+        self.project.mark_modified()
+        return zone
+
+    def update_detection_settings(self, source_sheet_id: str, settings: DetectionSettingsModel) -> None:
+        sheet = self.source_sheet(source_sheet_id)
+        self._push_proposal_history(source_sheet_id)
+        sheet.detection_settings = settings
+        self.project.mark_modified()
+
+    def detect_sprite_regions(self, source_sheet_id: str, settings: DetectionSettingsModel | None = None) -> DetectionResult:
+        sheet = self.source_sheet(source_sheet_id)
+        result, active_settings = self.preview_sprite_regions(source_sheet_id, settings)
+        self.apply_detection_result(source_sheet_id, result, active_settings)
+        return result
+
+    def preview_sprite_regions(
+        self,
+        source_sheet_id: str,
+        settings: DetectionSettingsModel | None = None,
+        cancel_requested=None,
+    ) -> tuple[DetectionResult, DetectionSettingsModel]:
+        sheet = self.source_sheet(source_sheet_id)
+        image = self._load_source_sheet_image(sheet)
+        if image is None:
+            raise RuntimeError("Source sheet image could not be loaded")
+        active_settings = DetectionSettingsModel.from_dict((settings or sheet.detection_settings).to_dict())
+        if not active_settings.background_samples:
+            active_settings.background_samples = deepcopy(sheet.background_samples) or common_color_suggestions(image, limit=3)
+        cache_key = proposal_cache_key(sheet.checksum, active_settings)
+        cached = self._detection_cache.get(cache_key)
+        if cached is not None:
+            return cached, active_settings
+        result = detect_crop_proposals(image, source_sheet_id, active_settings, exclusion_zones=sheet.exclusion_zones, cancel_requested=cancel_requested)
+        self._detection_cache[cache_key] = result
+        return result, active_settings
+
+    def apply_detection_result(self, source_sheet_id: str, result: DetectionResult, settings: DetectionSettingsModel) -> None:
+        sheet = self.source_sheet(source_sheet_id)
+        self._push_proposal_history(source_sheet_id)
+        sheet.detection_settings = settings
+        sheet.crop_proposals = result.proposals
+        self.project.mark_modified()
+
+    def undo_proposal_edit(self, source_sheet_id: str) -> bool:
+        undo_stack = self._proposal_undo_stacks.get(source_sheet_id)
+        if not undo_stack:
+            return False
+        current = self._proposal_state_snapshot(source_sheet_id)
+        snapshot = undo_stack.pop()
+        self._proposal_redo_stacks.setdefault(source_sheet_id, []).append(current)
+        self._restore_proposal_state(source_sheet_id, snapshot)
+        return True
+
+    def redo_proposal_edit(self, source_sheet_id: str) -> bool:
+        redo_stack = self._proposal_redo_stacks.get(source_sheet_id)
+        if not redo_stack:
+            return False
+        current = self._proposal_state_snapshot(source_sheet_id)
+        snapshot = redo_stack.pop()
+        self._proposal_undo_stacks.setdefault(source_sheet_id, []).append(current)
+        self._restore_proposal_state(source_sheet_id, snapshot)
+        return True
+
+    def proposal_by_uuid(self, source_sheet_id: str, proposal_uuid: str) -> CropProposal:
+        sheet = self.source_sheet(source_sheet_id)
+        for proposal in sheet.crop_proposals:
+            if proposal.proposal_uuid == proposal_uuid:
+                return proposal
+        raise KeyError(proposal_uuid)
+
+    def move_proposal(self, source_sheet_id: str, proposal_uuid: str, dx: int, dy: int) -> CropProposal:
+        proposal = self.proposal_by_uuid(source_sheet_id, proposal_uuid)
+        self._push_proposal_history(source_sheet_id)
+        proposal.rect = CropRect(proposal.rect.x + int(dx), proposal.rect.y + int(dy), proposal.rect.width, proposal.rect.height)
+        proposal.padded_rect = CropRect(proposal.padded_rect.x + int(dx), proposal.padded_rect.y + int(dy), proposal.padded_rect.width, proposal.padded_rect.height)
+        proposal.status = ProposalStatus.modified
+        proposal.user_modified = True
+        proposal.modified_at = utc_now_iso()
+        self.project.mark_modified()
+        return proposal
+
+    def resize_proposal(self, source_sheet_id: str, proposal_uuid: str, width: int, height: int) -> CropProposal:
+        proposal = self.proposal_by_uuid(source_sheet_id, proposal_uuid)
+        self._push_proposal_history(source_sheet_id)
+        proposal.rect = CropRect(proposal.rect.x, proposal.rect.y, max(1, int(width)), max(1, int(height)))
+        proposal.padded_rect = CropRect(proposal.padded_rect.x, proposal.padded_rect.y, max(1, int(width)), max(1, int(height)))
+        proposal.width = proposal.rect.width
+        proposal.height = proposal.rect.height
+        proposal.status = ProposalStatus.modified
+        proposal.user_modified = True
+        proposal.modified_at = utc_now_iso()
+        self.project.mark_modified()
+        return proposal
+
+    def merge_proposals(self, source_sheet_id: str, proposal_uuids: Iterable[str], padding: int = 0) -> CropProposal:
+        sheet = self.source_sheet(source_sheet_id)
+        selected = [proposal for proposal in sheet.crop_proposals if proposal.proposal_uuid in set(proposal_uuids)]
+        if len(selected) < 2:
+            raise ValueError("At least two proposals are required to merge")
+        self._push_proposal_history(source_sheet_id)
+        merged = merge_crop_proposals(selected, source_sheet_uuid=source_sheet_id, padding=padding)
+        sheet.crop_proposals = [proposal for proposal in sheet.crop_proposals if proposal.proposal_uuid not in {item.proposal_uuid for item in selected}]
+        sheet.crop_proposals.append(merged)
+        self.project.mark_modified()
+        return merged
+
+    def split_proposal_vertical(self, source_sheet_id: str, proposal_uuid: str, split_x: int) -> tuple[CropProposal, CropProposal]:
+        sheet = self.source_sheet(source_sheet_id)
+        proposal = self.proposal_by_uuid(source_sheet_id, proposal_uuid)
+        self._push_proposal_history(source_sheet_id)
+        left, right = split_crop_proposal_vertical(proposal, split_x)
+        sheet.crop_proposals = [item for item in sheet.crop_proposals if item.proposal_uuid != proposal_uuid] + [left, right]
+        self.project.mark_modified()
+        return left, right
+
+    def split_proposal_horizontal(self, source_sheet_id: str, proposal_uuid: str, split_y: int) -> tuple[CropProposal, CropProposal]:
+        sheet = self.source_sheet(source_sheet_id)
+        proposal = self.proposal_by_uuid(source_sheet_id, proposal_uuid)
+        self._push_proposal_history(source_sheet_id)
+        top, bottom = split_crop_proposal_horizontal(proposal, split_y)
+        sheet.crop_proposals = [item for item in sheet.crop_proposals if item.proposal_uuid != proposal_uuid] + [top, bottom]
+        self.project.mark_modified()
+        return top, bottom
+
+    def assign_proposal_to_asset(self, source_sheet_id: str, proposal_uuid: str, asset_uuid: str, warn_before_replace: bool = True) -> AssetRecord:
+        proposal = self.proposal_by_uuid(source_sheet_id, proposal_uuid)
+        asset = self.get_asset(asset_uuid)
+        if warn_before_replace and asset.crop_rect is not None:
+            pass
+        self._push_proposal_history(source_sheet_id)
+        asset.crop_rect = proposal.rect
+        asset.workflow_status = WorkflowStatus.cropped
+        asset.modified_at = utc_now_iso()
+        proposal.status = ProposalStatus.assigned
+        proposal.assigned_asset_uuid = asset.asset_uuid
+        proposal.modified_at = utc_now_iso()
+        self.invalidate_manual_edits(asset.asset_uuid, "proposal_assigned")
+        self.project.log("proposal_assigned", f"Assigned proposal {proposal.proposal_uuid} to {asset.display_name}", asset.asset_uuid)
+        self.project.mark_modified()
+        return asset
+
+    def create_asset_from_proposal(self, source_sheet_id: str, proposal_uuid: str, **overrides) -> AssetRecord:
+        proposal = self.proposal_by_uuid(source_sheet_id, proposal_uuid)
+        sheet = self.source_sheet(source_sheet_id)
+        base_name = overrides.get("display_name") or f"detected_region_{len(self.project.assets) + 1:02d}"
+        asset = self.add_asset(
+            display_name=base_name,
+            source_sheet_id=sheet.source_sheet_id,
+            source_sheet_path=sheet.path,
+            character_group=overrides.get("character_group", ""),
+            category=overrides.get("category", "other"),
+            action=overrides.get("action", "detected"),
+            direction=overrides.get("direction", "none"),
+            frame_number=overrides.get("frame_number"),
+            variant=overrides.get("variant", ""),
+            output_folder=overrides.get("output_folder", ""),
+            notes=overrides.get("notes", proposal.notes),
+            crop_rect=proposal.rect,
+        )
+        proposal.status = ProposalStatus.assigned
+        proposal.assigned_asset_uuid = asset.asset_uuid
+        proposal.modified_at = utc_now_iso()
+        self.project.mark_modified()
+        return asset
 
     def _raw_crop_for_asset(self, asset: AssetRecord) -> Image.Image | None:
         sheet = next((item for item in self.project.source_sheets if item.source_sheet_id == asset.source_sheet_id), None)

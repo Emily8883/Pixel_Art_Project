@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .models import CropRect
+from .detection import BackgroundSample, CropProposal, DetectionSettingsModel, ExclusionZone
 from .processing import ui_tolerance_to_distance
 from .normalization import NormalizationSettingsModel
 
@@ -59,6 +60,11 @@ class SourceSheet:
     width: int | None = None
     height: int | None = None
     missing: bool = False
+    detection_settings: DetectionSettingsModel = field(default_factory=DetectionSettingsModel)
+    background_samples: list[BackgroundSample] = field(default_factory=list)
+    exclusion_zones: list[ExclusionZone] = field(default_factory=list)
+    crop_proposals: list[CropProposal] = field(default_factory=list)
+    analysis_region: CropRect | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, project_dir: Path | None = None) -> dict[str, Any]:
@@ -70,6 +76,11 @@ class SourceSheet:
             "width": self.width,
             "height": self.height,
             "missing": self.missing,
+            "detection_settings": self.detection_settings.to_dict(),
+            "background_samples": [sample.to_dict() for sample in self.background_samples],
+            "exclusion_zones": [zone.to_dict() for zone in self.exclusion_zones],
+            "crop_proposals": [proposal.to_dict() for proposal in self.crop_proposals],
+            "analysis_region": self.analysis_region.to_dict() if self.analysis_region else None,
         }
         if project_dir is not None:
             data["path"] = _serialize_path(self.path, project_dir)
@@ -90,6 +101,11 @@ class SourceSheet:
                 "width",
                 "height",
                 "missing",
+                "detection_settings",
+                "background_samples",
+                "exclusion_zones",
+                "crop_proposals",
+                "analysis_region",
             }
         }
         path = str(payload.get("path", ""))
@@ -103,6 +119,11 @@ class SourceSheet:
             width=_maybe_int(payload.get("width")),
             height=_maybe_int(payload.get("height")),
             missing=bool(payload.get("missing", False)),
+            detection_settings=DetectionSettingsModel.from_dict(payload.get("detection_settings", {})),
+            background_samples=[BackgroundSample.from_dict(item) for item in payload.get("background_samples", []) if isinstance(item, dict)],
+            exclusion_zones=[ExclusionZone.from_dict(item) for item in payload.get("exclusion_zones", []) if isinstance(item, dict)],
+            crop_proposals=[CropProposal.from_dict(item) for item in payload.get("crop_proposals", []) if isinstance(item, dict)],
+            analysis_region=CropRect.from_dict(payload["analysis_region"]) if isinstance(payload.get("analysis_region"), dict) else None,
             extras=extras,
         )
 
@@ -383,7 +404,7 @@ class ProjectDefaults:
 class ProjectRecord:
     project_name: str
     project_root_directory: str
-    project_version: int = 5
+    project_version: int = 6
     created_at: str = field(default_factory=utc_now_iso)
     modified_at: str = field(default_factory=utc_now_iso)
     notes: str = ""
@@ -433,7 +454,7 @@ class ProjectRecord:
         return cls(
             project_name=str(payload.get("project_name", "Untitled Project")),
             project_root_directory=project_root_directory,
-            project_version=int(payload.get("project_version", 5)),
+            project_version=int(payload.get("project_version", 6)),
             created_at=str(payload.get("created_at", utc_now_iso())),
             modified_at=str(payload.get("modified_at", utc_now_iso())),
             notes=str(payload.get("notes", "")),
@@ -450,6 +471,7 @@ class SpriteProject:
     source_sheets: list[SourceSheet] = field(default_factory=list)
     assets: list[AssetRecord] = field(default_factory=list)
     activity_log: list[ActivityEntry] = field(default_factory=list)
+    detection_presets: dict[str, dict[str, Any]] = field(default_factory=dict)
     legacy_fields: dict[str, Any] = field(default_factory=dict)
     path: Path | None = None
     modified: bool = False
@@ -457,11 +479,12 @@ class SpriteProject:
     def to_dict(self) -> dict[str, Any]:
         project_dir = self.path.parent if self.path else None
         payload = {
-            "config_version": 5,
+            "config_version": 6,
             "project": self.project.to_dict(project_dir),
             "source_sheets": [sheet.to_dict(project_dir) for sheet in self.source_sheets],
             "assets": [asset.to_dict(project_dir) for asset in self.assets],
             "activity_log": [entry.to_dict() for entry in self.activity_log],
+            "detection_presets": self.detection_presets,
         }
         payload.update(self.legacy_fields)
         return payload

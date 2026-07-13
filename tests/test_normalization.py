@@ -296,15 +296,15 @@ def test_version4_migration_to_version5(tmp_path):
     path = tmp_path / "project.json"
     save_project(project, path)
     loaded = load_project(path)
-    assert loaded.project.project_version == 5
+    assert loaded.project.project_version == 6
 
 
 def test_version5_project_round_trip(tmp_path):
-    project = SpriteProject(project=ProjectRecord(project_name="New", project_root_directory=str(tmp_path), project_version=5))
+    project = SpriteProject(project=ProjectRecord(project_name="New", project_root_directory=str(tmp_path), project_version=6))
     path = tmp_path / "project.json"
     save_project(project, path)
     loaded = load_project(path)
-    assert loaded.project.project_version == 5
+    assert loaded.project.project_version == 6
 
 
 def test_normalization_checksum():

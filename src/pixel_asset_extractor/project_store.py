@@ -108,7 +108,7 @@ def build_project_from_legacy_config(config: CropConfig | dict[str, Any], projec
         project=ProjectRecord(
             project_name="Migrated Project",
             project_root_directory=project_root,
-            project_version=5,
+            project_version=6,
             created_at=utc_now_iso(),
             modified_at=utc_now_iso(),
         ),
@@ -184,17 +184,19 @@ def _load_v3_project(payload: dict[str, Any], path: Path) -> SpriteProject:
     from .project_model import ActivityEntry
 
     activity_entries = [ActivityEntry.from_dict(item) for item in activity_log if isinstance(item, dict)]
+    detection_presets = payload.get("detection_presets", {})
     legacy_fields = {
         key: value
         for key, value in payload.items()
-        if key not in {"config_version", "project", "source_sheets", "assets", "activity_log"}
+        if key not in {"config_version", "project", "source_sheets", "assets", "activity_log", "detection_presets"}
     }
-    project.project_version = 5
+    project.project_version = 6
     return SpriteProject(
         project=project,
         source_sheets=source_sheet_records,
         assets=asset_records,
         activity_log=activity_entries,
+        detection_presets=detection_presets if isinstance(detection_presets, dict) else {},
         legacy_fields=legacy_fields,
         path=path,
     )

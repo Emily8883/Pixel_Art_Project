@@ -386,7 +386,7 @@ def test_v3_migration_to_v4(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     project = load_project(path)
-    assert project.project.project_version == 5
+    assert project.project.project_version == 6
 
 
 def test_v4_project_round_trip(tmp_path):
@@ -397,7 +397,7 @@ def test_v4_project_round_trip(tmp_path):
     save_project(project, path)
     loaded = load_project(path)
 
-    assert loaded.project.project_version == 5
+    assert loaded.project.project_version == 6
 
 
 def test_sidecar_png_atomic_save(tmp_path):
