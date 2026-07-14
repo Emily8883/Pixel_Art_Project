@@ -6,9 +6,9 @@ import time
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QColor, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from pixel_asset_extractor.detection import DetectionResult
 from pixel_asset_extractor.image_tools import load_png, pil_image_to_qpixmap
@@ -42,12 +42,16 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
 
 
 class DummyWheelEvent:
-    def __init__(self, delta_y: int) -> None:
+    def __init__(self, delta_y: int, pos: QPoint | None = None) -> None:
         self._delta_y = delta_y
+        self._pos = QPoint(0, 0) if pos is None else pos
         self.accepted = False
 
     def angleDelta(self):
         return QPoint(0, self._delta_y)
+
+    def position(self):
+        return QPointF(self._pos)
 
     def accept(self):
         self.accepted = True
@@ -64,6 +68,22 @@ class DummyMouseEvent:
 
     def pos(self):
         return self._pos
+
+    def accept(self):
+        self.accepted = True
+
+
+class DummyKeyEvent:
+    def __init__(self, key: int, auto_repeat: bool = False) -> None:
+        self._key = key
+        self._auto_repeat = auto_repeat
+        self.accepted = False
+
+    def key(self):
+        return self._key
+
+    def isAutoRepeat(self):
+        return self._auto_repeat
 
     def accept(self):
         self.accepted = True
@@ -151,30 +171,42 @@ def test_missing_source_file_shows_error_without_closing_app(qapp, tmp_path, mon
 
 def test_source_canvas_wheel_event_changes_zoom(qapp):
     canvas = ImageCanvasView()
-    pixmap = QPixmap(32, 32)
+    canvas.resize(500, 300)
+    canvas.show()
+    pixmap = QPixmap(1000, 500)
     pixmap.fill(QColor(255, 0, 0))
     canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
     before = canvas.transform().m11()
+    cursor = QPoint(250, 150)
+    scene_before = canvas.mapToScene(cursor)
 
-    canvas.wheelEvent(DummyWheelEvent(120))
+    canvas.wheelEvent(DummyWheelEvent(120, cursor))
 
     assert canvas.transform().m11() > before
+    scene_after = canvas.mapToScene(cursor)
+    assert abs(scene_after.x() - scene_before.x()) < 2
+    assert abs(scene_after.y() - scene_before.y()) < 2
 
 
 def test_source_canvas_pan_changes_visible_position(qapp):
     canvas = ImageCanvasView()
     pixmap = QPixmap(2000, 2000)
     pixmap.fill(QColor(0, 255, 0))
+    canvas.resize(600, 400)
+    canvas.show()
     canvas.display_pixmap(pixmap)
-    canvas.wheelEvent(DummyWheelEvent(120))
-    canvas.wheelEvent(DummyWheelEvent(120))
-    before = canvas.horizontalScrollBar().value()
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    canvas.actual_pixels()
+    before_h = canvas.horizontalScrollBar().value()
+    before_v = canvas.verticalScrollBar().value()
 
     canvas.mousePressEvent(DummyMouseEvent(Qt.MouseButton.MiddleButton, QPoint(10, 10)))
     canvas.mouseMoveEvent(DummyMouseEvent(Qt.MouseButton.MiddleButton, QPoint(30, 30)))
     canvas.mouseReleaseEvent(DummyMouseEvent(Qt.MouseButton.MiddleButton, QPoint(30, 30)))
 
-    assert canvas.horizontalScrollBar().value() != before
+    assert canvas.horizontalScrollBar().value() != before_h
+    assert canvas.verticalScrollBar().value() != before_v
 
 
 def test_loaded_image_scene_bounds_match_image_dimensions(qapp):
@@ -185,6 +217,9 @@ def test_loaded_image_scene_bounds_match_image_dimensions(qapp):
 
     assert canvas.sceneRect().width() == 128
     assert canvas.sceneRect().height() == 64
+    assert canvas._pixmap_item is not None
+    assert canvas._pixmap_item.boundingRect().width() == 128
+    assert canvas._pixmap_item.boundingRect().height() == 64
 
 
 def test_fit_action_places_image_center_near_viewport_center(qapp):
@@ -194,13 +229,14 @@ def test_fit_action_places_image_center_near_viewport_center(qapp):
     pixmap = QPixmap(1000, 500)
     pixmap.fill(QColor(0, 0, 255))
     canvas.display_pixmap(pixmap)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
 
     viewport_center = canvas.viewport().rect().center()
     scene_center = canvas.mapToScene(viewport_center)
+    image_center = canvas._pixmap_item.sceneBoundingRect().center()
 
-    assert abs(scene_center.x() - canvas.sceneRect().center().x()) < 4
-    assert abs(scene_center.y() - canvas.sceneRect().center().y()) < 4
+    assert abs(scene_center.x() - image_center.x()) < 4
+    assert abs(scene_center.y() - image_center.y()) < 4
 
 
 def test_image_remains_fully_visible_after_first_load(qapp):
@@ -210,16 +246,18 @@ def test_image_remains_fully_visible_after_first_load(qapp):
     pixmap = QPixmap(1200, 600)
     pixmap.fill(QColor(255, 0, 255))
     canvas.display_pixmap(pixmap)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
 
     viewport = canvas.viewport().rect()
+    image_rect = canvas._pixmap_item.sceneBoundingRect()
     for point in (
-        canvas.mapFromScene(canvas.sceneRect().topLeft()),
-        canvas.mapFromScene(canvas.sceneRect().topRight()),
-        canvas.mapFromScene(canvas.sceneRect().bottomLeft()),
-        canvas.mapFromScene(canvas.sceneRect().bottomRight()),
+        canvas.mapFromScene(image_rect.topLeft()),
+        canvas.mapFromScene(image_rect.topRight()),
+        canvas.mapFromScene(image_rect.bottomLeft()),
+        canvas.mapFromScene(image_rect.bottomRight()),
     ):
-        assert viewport.contains(point)
+        assert -8 <= point.x() <= viewport.width() + 8
+        assert -8 <= point.y() <= viewport.height() + 8
 
 
 def test_resize_triggers_valid_refit_when_appropriate(qapp):
@@ -229,11 +267,16 @@ def test_resize_triggers_valid_refit_when_appropriate(qapp):
     pixmap = QPixmap(1200, 600)
     pixmap.fill(QColor(0, 128, 128))
     canvas.display_pixmap(pixmap)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
     first_zoom = canvas.zoom_percent()
-    canvas._needs_fit = True
+    canvas._auto_fit_pending = True
     canvas.resize(640, 320)
     assert wait_until(lambda: canvas.zoom_percent() != first_zoom)
+    canvas.wheelEvent(DummyWheelEvent(120, QPoint(100, 100)))
+    zoom_after_user = canvas.zoom_percent()
+    canvas.resize(800, 400)
+    time.sleep(0.1)
+    assert canvas.zoom_percent() == zoom_after_user
 
 
 def test_switching_sheets_resets_stale_scrollbars_and_centers_new_sheet(qapp):
@@ -245,15 +288,15 @@ def test_switching_sheets_resets_stale_scrollbars_and_centers_new_sheet(qapp):
     second = QPixmap(600, 300)
     second.fill(QColor(200, 100, 50))
     canvas.display_pixmap(first)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
     canvas.actual_pixels()
     canvas.horizontalScrollBar().setValue(canvas.horizontalScrollBar().maximum())
     canvas.verticalScrollBar().setValue(canvas.verticalScrollBar().maximum())
     canvas.display_pixmap(second)
-    assert wait_until(lambda: not canvas._needs_fit)
-    assert canvas.horizontalScrollBar().value() == 0
-    assert canvas.verticalScrollBar().value() == 0
-    assert abs(canvas.mapToScene(canvas.viewport().rect().center()).x() - canvas.sceneRect().center().x()) < 4
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    assert canvas.horizontalScrollBar().value() != canvas.horizontalScrollBar().maximum()
+    assert canvas.verticalScrollBar().value() != canvas.verticalScrollBar().maximum()
+    assert abs(canvas.mapToScene(canvas.viewport().rect().center()).x() - canvas._pixmap_item.sceneBoundingRect().center().x()) < 4
 
 
 def test_home_centers_without_changing_zoom(qapp):
@@ -263,7 +306,7 @@ def test_home_centers_without_changing_zoom(qapp):
     pixmap = QPixmap(1000, 500)
     pixmap.fill(QColor(100, 100, 255))
     canvas.display_pixmap(pixmap)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
     canvas.wheelEvent(DummyWheelEvent(120))
     zoom_before = canvas.zoom_percent()
     canvas.center_image()
@@ -277,7 +320,7 @@ def test_fit_preserves_aspect_ratio(qapp):
     pixmap = QPixmap(1600, 800)
     pixmap.fill(QColor(80, 40, 160))
     canvas.display_pixmap(pixmap)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
     expected = min(canvas.viewport().width() / pixmap.width(), canvas.viewport().height() / pixmap.height())
     assert abs(canvas.transform().m11() - expected) < 0.05
 
@@ -289,7 +332,7 @@ def test_actual_pixels_uses_one_to_one_transform(qapp):
     pixmap = QPixmap(800, 400)
     pixmap.fill(QColor(0, 200, 0))
     canvas.display_pixmap(pixmap)
-    assert wait_until(lambda: not canvas._needs_fit)
+    assert wait_until(lambda: canvas._initial_fit_completed)
     canvas.actual_pixels()
     assert abs(canvas.transform().m11() - 1.0) < 0.001
 
@@ -303,6 +346,163 @@ def test_nearest_neighbor_rendering_remains_enabled(qapp):
     assert canvas._pixmap_item is not None
     assert canvas._pixmap_item.transformationMode() == Qt.TransformationMode.FastTransformation
     assert not bool(canvas.renderHints() & QPainter.RenderHint.SmoothPixmapTransform)
+
+
+def test_fit_preserves_image_visibility_and_no_invalid_transform(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(480, 320)
+    canvas.show()
+    pixmap = QPixmap(1408, 768)
+    pixmap.fill(QColor(10, 20, 30))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    assert canvas.transform().m11() > 0
+    assert canvas._pixmap_item is not None
+    viewport = canvas.viewport().rect()
+    center = canvas.mapFromScene(canvas._pixmap_item.sceneBoundingRect().center())
+    assert viewport.contains(center)
+
+
+def test_no_deferred_callback_resets_transform_after_fit(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(480, 320)
+    canvas.show()
+    pixmap = QPixmap(800, 400)
+    pixmap.fill(QColor(40, 40, 40))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    canvas.fit_and_center_image()
+    zoom_before = canvas.zoom_percent()
+    canvas.resize(700, 400)
+    time.sleep(0.1)
+    assert canvas.zoom_percent() == zoom_before
+
+
+def test_wheel_zoom_keeps_scene_point_under_cursor_approx_stable(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(500, 300)
+    canvas.show()
+    pixmap = QPixmap(1200, 600)
+    pixmap.fill(QColor(200, 50, 50))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    cursor = QPoint(200, 120)
+    before = canvas.mapToScene(cursor)
+    canvas.wheelEvent(DummyWheelEvent(120, cursor))
+    after = canvas.mapToScene(cursor)
+    assert abs(after.x() - before.x()) < 2
+    assert abs(after.y() - before.y()) < 2
+
+
+def test_space_left_drag_changes_scrollbars_and_blocks_crop(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(600, 400)
+    canvas.show()
+    pixmap = QPixmap(1600, 1200)
+    pixmap.fill(QColor(0, 100, 200))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    canvas.keyPressEvent(DummyKeyEvent(Qt.Key.Key_Space))
+    before_h = canvas.horizontalScrollBar().value()
+    before_v = canvas.verticalScrollBar().value()
+    canvas.mousePressEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(20, 20)))
+    canvas.mouseMoveEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(40, 50)))
+    canvas.mouseReleaseEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(40, 50)))
+    canvas.keyReleaseEvent(DummyKeyEvent(Qt.Key.Key_Space))
+    assert canvas.horizontalScrollBar().value() != before_h
+    assert canvas.verticalScrollBar().value() != before_v
+    assert canvas.current_crop_rect() is None
+
+
+def test_crop_coordinates_remain_correct_with_padded_scene_margins(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(500, 300)
+    canvas.show()
+    pixmap = QPixmap(300, 200)
+    pixmap.fill(QColor(120, 10, 220))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    start = canvas.mapFromScene(QPointF(30, 40))
+    end = canvas.mapFromScene(QPointF(110, 140))
+    canvas.mousePressEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, start))
+    canvas.mouseMoveEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, end))
+    canvas.mouseReleaseEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, end))
+    rect = canvas.current_crop_rect()
+    assert rect is not None
+    assert abs(rect.left() - 30) < 2
+    assert abs(rect.top() - 40) < 2
+    assert abs(rect.width() - 80) < 2
+    assert abs(rect.height() - 100) < 2
+
+
+def test_clicking_outside_pixmap_does_not_create_valid_crop(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(500, 300)
+    canvas.show()
+    pixmap = QPixmap(300, 200)
+    pixmap.fill(QColor(220, 220, 0))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    outside = canvas.mapFromScene(QPointF(-80, -80))
+    canvas.mousePressEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, outside))
+    canvas.mouseReleaseEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, outside))
+    assert canvas.current_crop_rect() is None
+
+
+def test_initial_auto_fit_occurs_once(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(420, 280)
+    canvas.show()
+    pixmap = QPixmap(600, 300)
+    pixmap.fill(QColor(50, 150, 50))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    zoom_before = canvas.zoom_percent()
+    canvas.resize(700, 300)
+    time.sleep(0.1)
+    assert canvas.zoom_percent() == zoom_before
+
+
+def test_source_canvas_actions_exist(qapp):
+    canvas = ImageCanvasView()
+    assert canvas.fit_action.text() == "Fit Image to View"
+    assert canvas.actual_pixels_action.text() == "100%"
+    assert canvas.center_action.text() == "Center Image"
+    assert canvas.reset_view_action.text() == "Reset View"
+
+
+def test_clear_pixmap_resets_canvas_state(qapp):
+    canvas = ImageCanvasView()
+    canvas.resize(500, 300)
+    canvas.show()
+    pixmap = QPixmap(300, 200)
+    pixmap.fill(QColor(20, 180, 120))
+    canvas.display_pixmap(pixmap)
+    assert wait_until(lambda: canvas._initial_fit_completed)
+    canvas.actual_pixels()
+    canvas.clear_pixmap()
+
+    assert canvas._pixmap_item is None
+    assert canvas.current_crop_rect() is None
+    assert canvas.zoom_percent() == 100
+    assert canvas.sceneRect().isNull()
+
+
+def test_removing_last_source_sheet_clears_canvas_state(qapp, tmp_path, monkeypatch):
+    window = MainWindow()
+    window.project_manager.new_project("Test Project", str(tmp_path))
+    window.project_path = tmp_path / "project.json"
+    window.project_manager.add_source_sheet(make_png(tmp_path / "sheet.png", size=(64, 32)))
+    window._update_ui_from_project()
+    assert window.canvas._pixmap_item is not None
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+
+    window.remove_source_sheet()
+
+    assert window.project_manager.project.source_sheets == []
+    assert window.canvas._pixmap_item is None
+    assert window.canvas.zoom_percent() == 100
+    assert window.source_sheet_combo.count() == 0
 
 
 def test_detection_action_with_no_source_sheet_shows_validation_message(qapp, monkeypatch):

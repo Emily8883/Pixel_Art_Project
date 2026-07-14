@@ -690,6 +690,12 @@ class MainWindow(QMainWindow):
         for sheet in self.project_manager.project.source_sheets:
             self.source_sheet_combo.addItem(sheet.label, sheet.source_sheet_id)
         self.source_sheet_combo.blockSignals(False)
+        if not self.project_manager.project.source_sheets:
+            self._active_sheet_id = None
+            self.canvas.clear_pixmap()
+            self.source_sheet_label.setText("No source sheets loaded")
+            self.source_image_info_label.setText("Source sheet info unavailable.")
+            return
         if self.project_manager.project.source_sheets:
             active_sheet_id = self.project_manager.project.project.extras.get("active_source_sheet_id")
             index = self.source_sheet_combo.findData(active_sheet_id) if active_sheet_id else -1
@@ -830,10 +836,7 @@ class MainWindow(QMainWindow):
 
     def display_source_sheet(self, sheet: SourceSheet | None) -> bool:
         if sheet is None:
-            self.canvas.scene().clear()
-            self.canvas._pixmap_item = None
-            self.canvas._pixmap = None
-            self.canvas._image_size = None
+            self.canvas.clear_pixmap()
             self.source_sheet_label.setText("No source sheets loaded")
             self.source_image_info_label.setText("Source sheet info unavailable.")
             return False
@@ -854,10 +857,7 @@ class MainWindow(QMainWindow):
             self.project_manager.project.mark_modified()
         if not path.exists():
             sheet.missing = True
-            self.canvas.scene().clear()
-            self.canvas._pixmap_item = None
-            self.canvas._pixmap = None
-            self.canvas._image_size = None
+            self.canvas.clear_pixmap()
             self.source_image_info_label.setText(f"Missing source sheet: {sheet.label}\n{path}")
             self._show_error("Missing source sheet", f"The source sheet does not exist:\n{path}")
             return False
@@ -868,10 +868,7 @@ class MainWindow(QMainWindow):
             except ImageLoadError as exc:
                 logger.exception("Could not load source sheet %s", sheet.source_sheet_id)
                 self._show_error("Could not open source sheet", str(exc))
-                self.canvas.scene().clear()
-                self.canvas._pixmap_item = None
-                self.canvas._pixmap = None
-                self.canvas._image_size = None
+                self.canvas.clear_pixmap()
                 return False
 
         image = self._loaded_images[sheet.source_sheet_id]
@@ -882,7 +879,6 @@ class MainWindow(QMainWindow):
             logger.exception("Could not display source sheet %s", sheet.source_sheet_id)
             self._show_error("Could not display source sheet", f"{exc}")
             return False
-        self.canvas.scene().setSceneRect(self.canvas.scene().itemsBoundingRect())
         self.source_image_info_label.setText(
             f"{sheet.label}\n{path}\n{sheet.width or image.width} x {sheet.height or image.height}"
         )
