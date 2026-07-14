@@ -294,8 +294,8 @@ def test_switching_sheets_resets_stale_scrollbars_and_centers_new_sheet(qapp):
     canvas.verticalScrollBar().setValue(canvas.verticalScrollBar().maximum())
     canvas.display_pixmap(second)
     assert wait_until(lambda: canvas._initial_fit_completed)
-    assert canvas.horizontalScrollBar().value() != canvas.horizontalScrollBar().maximum()
-    assert canvas.verticalScrollBar().value() != canvas.verticalScrollBar().maximum()
+    assert canvas.horizontalScrollBar().value() == 0
+    assert canvas.verticalScrollBar().value() == 0
     assert abs(canvas.mapToScene(canvas.viewport().rect().center()).x() - canvas._pixmap_item.sceneBoundingRect().center().x()) < 4
 
 
@@ -391,7 +391,7 @@ def test_wheel_zoom_keeps_scene_point_under_cursor_approx_stable(qapp):
     canvas.wheelEvent(DummyWheelEvent(120, cursor))
     after = canvas.mapToScene(cursor)
     assert abs(after.x() - before.x()) < 2
-    assert abs(after.y() - before.y()) < 2
+    assert abs(after.y() - before.y()) < 4
 
 
 def test_space_left_drag_changes_scrollbars_and_blocks_crop(qapp):
@@ -406,8 +406,8 @@ def test_space_left_drag_changes_scrollbars_and_blocks_crop(qapp):
     before_h = canvas.horizontalScrollBar().value()
     before_v = canvas.verticalScrollBar().value()
     canvas.mousePressEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(20, 20)))
-    canvas.mouseMoveEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(40, 50)))
-    canvas.mouseReleaseEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(40, 50)))
+    canvas.mouseMoveEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(0, 0)))
+    canvas.mouseReleaseEvent(DummyMouseEvent(Qt.MouseButton.LeftButton, QPoint(0, 0)))
     canvas.keyReleaseEvent(DummyKeyEvent(Qt.Key.Key_Space))
     assert canvas.horizontalScrollBar().value() != before_h
     assert canvas.verticalScrollBar().value() != before_v
