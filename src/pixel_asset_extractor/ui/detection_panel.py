@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import traceback
 from dataclasses import replace
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
 from PySide6.QtWidgets import (
@@ -13,6 +16,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QDoubleSpinBox,
@@ -26,8 +30,8 @@ from ..detection import DETECTION_PRESETS, CropProposal, DetectionSettingsModel,
 
 
 class DetectionWorker(QObject):
-    finished = Signal(object, object)
-    failed = Signal(str)
+    finished = Signal(object, object, bool)
+    failed = Signal(str, str)
     cancelled = Signal()
 
     def __init__(self, manager, source_sheet_id: str, settings: DetectionSettingsModel, commit: bool = False) -> None:
@@ -55,9 +59,11 @@ class DetectionWorker(QObject):
             if self._cancelled:
                 self.cancelled.emit()
                 return
-            self.finished.emit(result, settings)
+            self.finished.emit(result, settings, self._commit)
         except Exception as exc:  # pragma: no cover - UI error path
-            self.failed.emit(str(exc))
+            tb = traceback.format_exc()
+            logging.getLogger(__name__).exception("Detection worker failed")
+            self.failed.emit(str(exc), tb)
 
 
 class DetectionPanelWidget(QWidget):
@@ -68,6 +74,7 @@ class DetectionPanelWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._logger = logging.getLogger(__name__)
         self._manager = None
         self._source_sheet_id: str | None = None
         self._project_path = None
@@ -267,6 +274,55 @@ class DetectionPanelWidget(QWidget):
             return
         self._load_sheet_state()
 
+    def _resolved_source_path(self) -> Path | None:
+        if self._manager is None or self._source_sheet_id is None:
+            return None
+        sheet = self._manager.source_sheet(self._source_sheet_id)
+        path = Path(sheet.path)
+        if not path.is_absolute():
+            if self._project_path is not None:
+                path = Path(self._project_path).parent / path
+            else:
+                project_root = getattr(self._manager.project.project, "project_root_directory", "")
+                if project_root:
+                    path = Path(project_root) / path
+        return path
+
+    def _validate_detection_context(self, commit: bool) -> bool:
+        if self._manager is None:
+            QMessageBox.warning(self, "Detection unavailable", "No project is loaded.")
+            return False
+        if self._source_sheet_id is None:
+            QMessageBox.warning(self, "Detection unavailable", "Choose a source sheet first.")
+            return False
+        try:
+            sheet = self._manager.source_sheet(self._source_sheet_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Detection unavailable", f"Source sheet is missing:\n{exc}")
+            return False
+        path = self._resolved_source_path()
+        self._logger.info(
+            "Detection requested source_sheet_uuid=%s path=%s commit=%s",
+            sheet.source_sheet_id,
+            path,
+            commit,
+        )
+        if path is None or not path.exists():
+            QMessageBox.warning(self, "Detection unavailable", f"Source file does not exist:\n{path or sheet.path}")
+            return False
+        try:
+            from ..image_tools import load_png
+
+            image = load_png(path)
+        except Exception as exc:
+            tb = traceback.format_exc()
+            self._logger.exception("Detection validation image load failed")
+            QMessageBox.critical(self, "Detection failed", f"Could not load the source image:\n{exc}")
+            self._logger.error(tb)
+            return False
+        self._logger.info("Detection validation loaded image %sx%s", image.width, image.height)
+        return True
+
     def current_settings(self) -> DetectionSettingsModel:
         methods = []
         if self.methods_background.isChecked():
@@ -439,47 +495,82 @@ class DetectionPanelWidget(QWidget):
         settings = self._manager.load_detection_preset(self.preset_combo.currentText())
         self._load_settings(settings)
 
-    def _start_worker(self, commit: bool) -> None:
+    def _start_worker(self, commit: bool) -> bool:
+        if not self._validate_detection_context(commit):
+            return False
         if self._manager is None or self._source_sheet_id is None:
-            return
+            return False
         if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait(200)
+            self._cancel_worker()
         settings = self.current_settings()
         self._thread = QThread(self)
         self._worker = DetectionWorker(self._manager, self._source_sheet_id, settings, commit=commit)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(lambda result, detected_settings: self._on_worker_finished(result, detected_settings, commit))
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.cancelled.connect(self._on_worker_cancelled)
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
         self._worker.cancelled.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_worker)
+        self._logger.info(
+            "Detection worker start source_sheet_uuid=%s commit=%s",
+            self._source_sheet_id,
+            commit,
+        )
         self._thread.start()
+        return True
 
+    def _cancel_worker(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+        if self._thread is not None:
+            self._thread.requestInterruption()
+            self._thread.quit()
+            self._thread.wait(1000)
+        self._cleanup_worker()
+
+    @Slot()
+    def _cleanup_worker(self) -> None:
+        self._worker = None
+        self._thread = None
+
+    @Slot(object, object, bool)
     def _on_worker_finished(self, result, settings, commit: bool) -> None:
         self._last_result = result
         if commit and self._manager is not None and self._source_sheet_id is not None:
             self._manager.apply_detection_result(self._source_sheet_id, result, settings)
         self._populate_proposals()
         self.analysis_summary.setText(f"{len(result.proposals)} proposals found")
+        self._logger.info(
+            "Detection worker success source_sheet_uuid=%s proposals=%s commit=%s",
+            self._source_sheet_id,
+            len(result.proposals),
+            commit,
+        )
         self.changed.emit()
         self._refresh_overlay()
 
-    def _on_worker_failed(self, message: str) -> None:
+    @Slot(str, str)
+    def _on_worker_failed(self, message: str, traceback_text: str) -> None:
         self.analysis_summary.setText(message)
+        self._logger.error("Detection worker failure: %s\n%s", message, traceback_text)
+        QMessageBox.critical(self, "Detection failed", f"{message}\n\nSee logs/pixel_asset_extractor.log for details.")
 
     def _on_worker_cancelled(self) -> None:
+        self._logger.info("Detection worker cancelled source_sheet_uuid=%s", self._source_sheet_id)
         self.analysis_summary.setText("Detection cancelled")
 
     def analyze(self) -> None:
-        self._start_worker(commit=False)
-        self.analyzeRequested.emit()
+        self._logger.info("Detection action start analyze source_sheet_uuid=%s", self._source_sheet_id)
+        if self._start_worker(commit=False):
+            self.analyzeRequested.emit()
 
     def generate_proposals(self) -> None:
-        self._start_worker(commit=True)
-        self.generateRequested.emit()
+        self._logger.info("Detection action start generate source_sheet_uuid=%s", self._source_sheet_id)
+        if self._start_worker(commit=True):
+            self.generateRequested.emit()
 
     def preview_mask(self) -> None:
         if self._last_result is None:

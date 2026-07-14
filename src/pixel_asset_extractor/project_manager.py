@@ -28,6 +28,17 @@ from .detection import (
     split_proposal_vertical as split_crop_proposal_vertical,
     proposal_cache_key,
 )
+from .batch_export import (
+    BatchExportManifest,
+    BatchExportSettings,
+    ExportPreviewEntry,
+    ExportVariant,
+    ValidationIssue,
+    build_export_preview,
+    classify_asset_for_export,
+    run_batch_export,
+    validation_issues_for_project,
+)
 from .models import CropRect
 from .normalization import (
     AlignmentDiagnostics,
@@ -786,6 +797,19 @@ class ProjectManager:
 
     def save_normalization_report_json(self, path: str | Path) -> Path:
         return report_to_json(self.asset_normalization_report(), path)
+
+    def validate_project(self) -> list[ValidationIssue]:
+        return validation_issues_for_project(self.project)
+
+    def batch_export_preview(self, settings: BatchExportSettings) -> list[ExportPreviewEntry]:
+        return build_export_preview(self.project, settings)
+
+    def classify_asset_for_export(self, asset_uuid: str, requested_variants: Iterable[ExportVariant]) -> str:
+        asset = self.get_asset(asset_uuid)
+        return classify_asset_for_export(self.project, asset, requested_variants).state
+
+    def run_batch_export(self, settings: BatchExportSettings, cancel_requested=None) -> tuple[BatchExportManifest, object]:
+        return run_batch_export(self.project, settings, cancel_requested=cancel_requested)
 
     def project_progress_counts(self) -> dict[str, int]:
         counts = {status.value: 0 for status in WorkflowStatus}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -55,11 +56,15 @@ from ..project_manager import ProjectManager
 from ..project_model import ActivityEntry, AssetRecord, BackgroundRemovalSettingsModel, SourceSheet, WorkflowStatus, utc_now_iso
 from ..project_store import build_project_from_legacy_config, load_project as load_sprite_project, save_project as save_sprite_project
 from .canvas_view import ImageCanvasView
+from .batch_export_dialog import BatchExportDialog, ProjectValidationDialog
 from .detection_panel import DetectionPanelWidget
 from .dialogs import ActivityLogDialog, AssetDialog
 from .manual_cleanup_widget import ManualCleanupWidget
 from .normalization_panel import CompareAlignmentDialog, NormalizationInspectorWidget, NormalizationReportDialog
 from .preview_view import CropPreviewView, PickedColor
+
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -83,6 +88,9 @@ class MainWindow(QMainWindow):
         self._autosave_timer.timeout.connect(self._maybe_autosave)
 
         self.canvas = ImageCanvasView()
+        self.canvas_zoom_label = QLabel("Zoom: 100%")
+        self.canvas_zoom_label.setStyleSheet("font-size: 11px; color: #666;")
+        self.canvas.zoomChanged.connect(self._sync_canvas_zoom)
         self.preview_view = CropPreviewView()
         self.preview_view.set_zoom_percent(100)
         self.detection_widget = DetectionPanelWidget()
@@ -222,6 +230,7 @@ class MainWindow(QMainWindow):
 
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
+        center_layout.addWidget(self.canvas_zoom_label)
         center_layout.addWidget(self.canvas)
 
         right_panel = QWidget()
@@ -261,6 +270,7 @@ class MainWindow(QMainWindow):
             ("Export Clean", self.export_clean),
             ("Export Final", self.export_final),
             ("Export Normalized", self.export_normalized),
+            ("Batch Export", self.batch_export),
             ("Detect Sprite Regions", self.detect_sprite_regions),
             ("Open Output Folder", self.open_output_folder),
             ("Create Freya Movement Template", self.create_freya_template),
@@ -272,6 +282,10 @@ class MainWindow(QMainWindow):
             toolbar.addAction(action)
 
     def _build_menus(self) -> None:
+        file_menu = self.menuBar().addMenu("File")
+        batch_action = QAction("Batch Export", self)
+        batch_action.triggered.connect(self.batch_export)
+        file_menu.addAction(batch_action)
         project_menu = self.menuBar().addMenu("Project")
         report_action = QAction("Normalization Report", self)
         report_action.triggered.connect(self._open_normalization_report)
@@ -279,6 +293,9 @@ class MainWindow(QMainWindow):
         compare_action = QAction("Compare Alignment", self)
         compare_action.triggered.connect(self._open_compare_alignment)
         project_menu.addAction(compare_action)
+        validate_action = QAction("Validate Project", self)
+        validate_action.triggered.connect(self.validate_project)
+        project_menu.addAction(validate_action)
         tools_menu = self.menuBar().addMenu("Tools")
         detect_action = QAction("Detect Sprite Regions", self)
         detect_action.triggered.connect(self.detect_sprite_regions)
@@ -513,6 +530,9 @@ class MainWindow(QMainWindow):
         self.preview_zoom_spin.blockSignals(False)
         self.zoom_status_label.setText(f"Current zoom: {value}%")
 
+    def _sync_canvas_zoom(self, value: int) -> None:
+        self.canvas_zoom_label.setText(f"Zoom: {value}%")
+
     def _schedule_preview_refresh(self, *_args) -> None:
         self._debounce_timer.start(120)
 
@@ -570,8 +590,11 @@ class MainWindow(QMainWindow):
         )
 
     def detect_sprite_regions(self) -> None:
-        if self._active_sheet_id is None:
+        sheet = self._current_source_sheet()
+        if sheet is None:
             self._show_warning("Choose a source sheet first.")
+            return
+        if not self.display_source_sheet(sheet):
             return
         self.detection_widget.generate_proposals()
 
@@ -668,7 +691,11 @@ class MainWindow(QMainWindow):
             self.source_sheet_combo.addItem(sheet.label, sheet.source_sheet_id)
         self.source_sheet_combo.blockSignals(False)
         if self.project_manager.project.source_sheets:
-            self.source_sheet_combo.setCurrentIndex(0)
+            active_sheet_id = self.project_manager.project.project.extras.get("active_source_sheet_id")
+            index = self.source_sheet_combo.findData(active_sheet_id) if active_sheet_id else -1
+            if index < 0:
+                index = 0
+            self.source_sheet_combo.setCurrentIndex(index)
             self._on_source_sheet_selected()
 
     def _refresh_asset_list(self, *_args) -> None:
@@ -801,24 +828,68 @@ class MainWindow(QMainWindow):
                     return sheet
         return None
 
-    def _load_source_sheet(self, sheet: SourceSheet) -> None:
+    def display_source_sheet(self, sheet: SourceSheet | None) -> bool:
+        if sheet is None:
+            self.canvas.scene().clear()
+            self.canvas._pixmap_item = None
+            self.canvas._pixmap = None
+            self.canvas._image_size = None
+            self.source_sheet_label.setText("No source sheets loaded")
+            self.source_image_info_label.setText("Source sheet info unavailable.")
+            return False
+
         path = Path(sheet.path)
+        if not path.is_absolute():
+            if self.project_path is not None:
+                path = self.project_path.parent / path
+            else:
+                project_root = self.project_manager.project.project.project_root_directory
+                if project_root:
+                    path = Path(project_root) / path
+        logger.info("Display source sheet uuid=%s path=%s resolved=%s", sheet.source_sheet_id, sheet.path, path)
+        self._active_sheet_id = sheet.source_sheet_id
+        previous_sheet_id = self.project_manager.project.project.extras.get("active_source_sheet_id")
+        self.project_manager.project.project.extras["active_source_sheet_id"] = sheet.source_sheet_id
+        if previous_sheet_id != sheet.source_sheet_id:
+            self.project_manager.project.mark_modified()
         if not path.exists():
             sheet.missing = True
-            self.source_image_info_label.setText(f"Missing source sheet: {sheet.label}\n{sheet.path}")
-            return
+            self.canvas.scene().clear()
+            self.canvas._pixmap_item = None
+            self.canvas._pixmap = None
+            self.canvas._image_size = None
+            self.source_image_info_label.setText(f"Missing source sheet: {sheet.label}\n{path}")
+            self._show_error("Missing source sheet", f"The source sheet does not exist:\n{path}")
+            return False
+
         if sheet.source_sheet_id not in self._loaded_images:
             try:
                 self._loaded_images[sheet.source_sheet_id] = load_png(path)
             except ImageLoadError as exc:
+                logger.exception("Could not load source sheet %s", sheet.source_sheet_id)
                 self._show_error("Could not open source sheet", str(exc))
-                return
+                self.canvas.scene().clear()
+                self.canvas._pixmap_item = None
+                self.canvas._pixmap = None
+                self.canvas._image_size = None
+                return False
+
         image = self._loaded_images[sheet.source_sheet_id]
-        pixmap = pil_image_to_qpixmap(image)
-        self.canvas.set_image(pixmap)
+        try:
+            pixmap = pil_image_to_qpixmap(image)
+            self.canvas.display_pixmap(pixmap)
+        except Exception as exc:
+            logger.exception("Could not display source sheet %s", sheet.source_sheet_id)
+            self._show_error("Could not display source sheet", f"{exc}")
+            return False
+        self.canvas.scene().setSceneRect(self.canvas.scene().itemsBoundingRect())
         self.source_image_info_label.setText(
-            f"{sheet.label}\n{sheet.path}\n{sheet.width or image.width} x {sheet.height or image.height}"
+            f"{sheet.label}\n{path}\n{sheet.width or image.width} x {sheet.height or image.height}"
         )
+        return True
+
+    def _load_source_sheet(self, sheet: SourceSheet) -> None:
+        self.display_source_sheet(sheet)
 
     def _on_source_sheet_selected(self, *_args) -> None:
         if self.source_sheet_combo.currentIndex() < 0:
@@ -829,7 +900,7 @@ class MainWindow(QMainWindow):
         self._active_sheet_id = str(sheet_id)
         sheet = self._source_sheet_lookup.get(self._active_sheet_id)
         if sheet is not None:
-            self._load_source_sheet(sheet)
+            self.display_source_sheet(sheet)
             self.source_sheet_label.setText(sheet.label)
         self._refresh_preview()
 
@@ -1197,6 +1268,7 @@ class MainWindow(QMainWindow):
         self._manual_documents.clear()
         self._active_sheet_id = None
         self._active_asset_id = None
+        self.project_manager.project.project.extras.pop("active_source_sheet_id", None)
         self._sync_detection_context()
         self._update_ui_from_project()
 
@@ -1227,6 +1299,9 @@ class MainWindow(QMainWindow):
         self.project_path = path
         self._loaded_images.clear()
         self._manual_documents.clear()
+        active_sheet_id = self.project_manager.project.project.extras.get("active_source_sheet_id")
+        if active_sheet_id:
+            self._active_sheet_id = str(active_sheet_id)
         self._sync_detection_context()
         self._update_ui_from_project()
         self.statusBar().showMessage(f"Loaded project: {path}", 4000)
@@ -1336,6 +1411,14 @@ class MainWindow(QMainWindow):
             return
         self.project_manager.export_normalized_asset(destination, asset.asset_uuid)
         self._update_ui_from_project()
+
+    def batch_export(self) -> None:
+        dialog = BatchExportDialog(self.project_manager, self)
+        dialog.exec()
+
+    def validate_project(self) -> None:
+        dialog = ProjectValidationDialog(self.project_manager, self)
+        dialog.exec()
 
     def _open_normalization_report(self) -> None:
         rows = self.project_manager.asset_normalization_report()
